@@ -29,8 +29,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-from .haar_5pt import Haar5ptDetector, align_face_5pt
-from .embed import ArcFaceEmbedderONNX
+from .vision.haar_5pt import Haar5ptDetector, align_face_5pt
+from .vision.embed import ArcFaceEmbedderONNX
 
 # -------------------------
 # Config
@@ -335,6 +335,27 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             
             if key == ord("q"):
+                total = len(base_samples) + len(new_samples)
+                if total >= max(3, cfg.samples_needed // 2):
+                    all_samples = base_samples + new_samples
+                    template = mean_embedding(all_samples)
+                    db[name] = template
+                    meta = {
+                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "embedding_dim": int(template.size),
+                        "names": sorted(db.keys()),
+                        "samples_existing_used": int(len(base_samples)),
+                        "samples_new_used": int(len(new_samples)),
+                        "samples_total_used": int(len(all_samples)),
+                        "note": "Auto-saved on quit. Embeddings are L2-normalized vectors.",
+                    }
+                    save_db(cfg, db, meta)
+                    print(f"Auto-saved '{name}' to {cfg.out_db_npz} ({total} samples).")
+                elif total > 0:
+                    print(
+                        f"Not saved: need at least {max(3, cfg.samples_needed // 2)} samples "
+                        f"(have {total}). Press 's' to save manually next time."
+                    )
                 break
             if key == ord("a"):
                 auto = not auto

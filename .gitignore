@@ -1,8 +1,11 @@
 venv/
 .venv/
-models/
-data/
 __pycache__/
 *.pyc
 .DS_Store
-logs/
+
+models/
+data/db/
+data/enroll/
+data/logs/
+data/locked_identity.json

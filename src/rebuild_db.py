@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List
 import cv2
 import numpy as np
-from .embed import ArcFaceEmbedderONNX
+from .vision.embed import ArcFaceEmbedderONNX
 from .enroll import EnrollConfig, ensure_dirs, save_db, mean_embedding, _list_existing_crops
 
 

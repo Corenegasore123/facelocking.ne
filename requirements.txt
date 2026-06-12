@@ -1,8 +1,6 @@
 numpy
 opencv-python
-tqdm
 mediapipe
 onnxruntime
-scipy
 paho-mqtt
-pandas
+websockets>=11.0
