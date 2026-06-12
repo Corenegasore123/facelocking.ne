@@ -139,11 +139,20 @@ Default MQTT settings (Corene):
 
 Movement payloads on `vision/Corene/movement`:
 
-- `LEFT` - locked face is left of frame center.
-- `RIGHT` - locked face is right of frame center.
-- `CENTER` - locked face is centered; the servo holds its current angle.
-- `SEARCH` - locked face is missing, sweep the servo.
-- `IDLE` - no active face lock.
+- `LEFT` / `MOVED_LEFT` — speaker left of center.
+- `RIGHT` / `MOVED_RIGHT` — speaker right of center.
+- `CENTER` / `CENTERED` — speaker centered.
+- `SEARCH` / `OUT_OF_FRAME` — speaker lost; pan sweep.
+- `IDLE` / `STOPPED` — hold / no active lock.
+
+Evidence logs also include BENAX `assessment_command` aliases (`MOVED_LEFT`, `CENTERED`, etc.).
+
+**Unlock options:**
+
+- Press **`l`** or **`u`** to manually unlock the speaker.
+- Auto-unlock after **`--unlock-timeout-sec`** (default 40s) if the speaker is not seen.
+- Auto-unlock after **`--search-unlock-sec`** (default 30s) if still searching without reacquire.
+- Disable search-unlock with `--search-unlock-sec 0`.
 
 Dashboard JSON is published on `vision/Corene/status`, including movement, lock state, target name, confidence, face count, horizontal error, FPS, threshold, and provider.
 
@@ -196,11 +205,13 @@ The JSON status topic is authoritative for the displayed command. Plain MQTT por
    - `PubSubClient`
    - `ESP32Servo`
 
-6. Upload with `arduino-cli`:
+6. Upload (re-flash after any firmware change):
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File addons/mqtt_servo_tracking/esp32/upload.ps1 -Port COM5
    ```
+
+   Sketch path: `addons/mqtt_servo_tracking/esp32/face_tracker/face_tracker.ino`
 
 For a different ESP32 board:
 

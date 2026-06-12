@@ -1850,6 +1850,7 @@ def main():
                 profile_ms=last_profile,
             )
             status_payload["mqtt_connected"] = bool(mqtt_publisher is not None and mqtt_publisher.connected)
+            status_payload["assessment_command"] = assessment_command_for(movement_command)
 
             mqtt_movement_result = "disabled"
             mqtt_status_result = "disabled"
