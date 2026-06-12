@@ -8,7 +8,8 @@ Single-speaker enrollment, face lock, MQTT servo tracking, evidence logging.
 FaceLocking/
 ├── config/corene.py              # Broker, topics, tuning
 ├── src/
-│   ├── face_locking.py           # Main app (tracker + MQTT)
+│   ├── recognize_mqtt.py         # Main tracker + MQTT (Corene topics)
+│   ├── face_locking.py           # Alternate tracker (same project layout)
 │   ├── enroll.py                 # Enrollment
 │   ├── rebuild_db.py             # Rebuild DB from crops
 │   ├── lock_state.py / unlock.py # Persisted speaker lock
@@ -39,10 +40,10 @@ Models in `models/`: `face_landmarker.task`, `embedder_arcface.onnx`
 ```bash
 python -m src.validate_system
 python -m src.enroll
-python -m src.face_locking
+python -m src.recognize_mqtt
 ```
 
-Recognition without MQTT: `python -m src.face_locking --disable-mqtt`
+Recognition without MQTT: `python -m src.recognize_mqtt --disable-mqtt`
 
 ## ESP32
 
@@ -54,9 +55,9 @@ powershell -ExecutionPolicy Bypass -File firmware/esp32/upload.ps1 -Port COM5
 
 ## MQTT (`config/corene.py`)
 
-Broker `157.173.101.159:1883` · topic `vision/Corene/servo_control`  
-Commands: `MOVED_LEFT`, `MOVED_RIGHT`, `CENTERED`, `SEARCHING`, `OUT_OF_FRAME`, `STOPPED`  
-Heartbeat: `vision/Corene/heartbeat` every 30s
+Broker `157.173.101.159:1883` · topic `vision/corene/movement` (ESP32 subscribes here)  
+Commands: `LEFT`, `RIGHT`, `CENTER`, `SEARCH`, `IDLE`  
+Dashboard status: `vision/corene/status` · heartbeat: `vision/corene/heartbeat`
 
 ## Keys
 

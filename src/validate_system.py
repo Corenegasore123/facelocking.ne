@@ -75,7 +75,7 @@ def main() -> int:
         all_ok &= check("MQTT broker publish", False, str(exc))
 
     all_ok &= check("ESP32 firmware sketch", ESP32_SKETCH.exists(), str(ESP32_SKETCH))
-    all_ok &= check("Main tracker", (Path(__file__).parent / "face_locking.py").exists())
+    all_ok &= check("Main tracker (recognize_mqtt)", (Path(__file__).parent / "recognize_mqtt.py").exists())
     dashboard_html = cfg.models_dir.parent / "dashboard" / "index.html"
     all_ok &= check("Dashboard UI", dashboard_html.exists(), str(dashboard_html))
 
@@ -87,7 +87,7 @@ def main() -> int:
 
     print("=" * 60)
     if all_ok:
-        print("All checks passed. Run: python -m src.face_locking")
+        print("All checks passed. Run: python -m src.recognize_mqtt")
         return 0
     print("Some checks failed. Fix the items above before the demo.")
     return 1

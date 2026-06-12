@@ -16,9 +16,10 @@ class CoreneConfig:
 
     mqtt_broker: str = "157.173.101.159"
     mqtt_port: int = 1883
-    movement_topic: str = "vision/Corene/servo_control"
-    status_topic: str = "vision/Corene/status"
-    heartbeat_topic: str = "vision/Corene/heartbeat"
+    # Match firmware/esp32/face_tracker_servo/face_tracker_servo.ino
+    movement_topic: str = "vision/corene/movement"
+    status_topic: str = "vision/corene/status"
+    heartbeat_topic: str = "vision/corene/heartbeat"
     dashboard_ws_url: str = "ws://157.173.101.159:9001"
     websocket_relay_port: int = 9002
 
@@ -33,23 +34,25 @@ class CoreneConfig:
     camera_width: int = 1280
     camera_height: int = 720
 
-    # BENAX motor command strings (plain text on movement topic)
-    cmd_left: str = "MOVED_LEFT"
-    cmd_right: str = "MOVED_RIGHT"
-    cmd_center: str = "CENTERED"
-    cmd_search: str = "SEARCHING"
-    cmd_out_of_frame: str = "OUT_OF_FRAME"
-    cmd_stop: str = "STOPPED"
+    # Plain text on movement topic — must match Arduino parseCommand()
+    cmd_left: str = "LEFT"
+    cmd_right: str = "RIGHT"
+    cmd_center: str = "CENTER"
+    cmd_search: str = "SEARCH"
+    cmd_out_of_frame: str = "SEARCH"
+    cmd_stop: str = "IDLE"
     heartbeat_interval_sec: float = 30.0
 
     # Tracking (aligned with stable Pascaline-style behaviour)
     match_threshold: float = 0.40
-    deadzone_px: float = 45.0
-    center_exit_hysteresis_px: float = 30.0
-    error_smooth_alpha: float = 0.35
-    command_confirm_frames: int = 2
-    track_publish_interval_sec: float = 0.15
-    track_lost_tolerance_frames: int = 2
+    deadzone_px: float = 65.0
+    center_exit_hysteresis_px: float = 45.0
+    side_switch_hysteresis_px: float = 35.0
+    error_smooth_alpha: float = 0.22
+    kps_smooth_alpha: float = 0.4
+    command_confirm_frames: int = 4
+    track_publish_interval_sec: float = 0.2
+    track_hold_frames: int = 10
     search_missing_frames: int = 12
     reacquire_frames: int = 5
     search_delay_sec: float = 0.3
