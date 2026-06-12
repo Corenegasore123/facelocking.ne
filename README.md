@@ -86,7 +86,7 @@ Open `diagrams/pipeline_flowchart.mmd` in [mermaid.live](https://mermaid.live) o
 1. Open `addons/mqtt_servo_tracking/esp32/face_tracker/face_tracker.ino`  
 2. Set `WIFI_SSID` / `WIFI_PASSWORD`  
 3. Confirm `MQTT_SERVER = "157.173.101.159"`  
-4. Wire servo signal → **D8 (GPIO15)**, power → **5 V**, GND → common ground (WiFi defaults: `RCA-OUTDOR`)  
+4. Wire servo signal → **D14 (GPIO14)**, power → **5 V**, GND → common ground (WiFi defaults: `RCA-OUTDOR`)  
 5. Upload (re-flash after any firmware change):
 
 ```powershell

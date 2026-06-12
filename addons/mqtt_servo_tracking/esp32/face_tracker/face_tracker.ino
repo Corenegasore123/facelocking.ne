@@ -1,7 +1,7 @@
 /*
  * Corene ESP32 pan servo — MQTT subscriber (ESP32 Dev Module only).
  *
- * Wiring: brown -> GND, red -> 5V/VIN, yellow signal -> D8 (GPIO15)
+ * Wiring: brown -> GND, red -> 5V/VIN, yellow signal -> D14 (GPIO14)
  *
  * Subscribes: vision/Corene/servo_control
  * Commands: MOVED_LEFT, MOVED_RIGHT, CENTERED, SEARCHING, STOPPED
@@ -20,7 +20,7 @@ const uint16_t MQTT_PORT = 1883;
 const char* MQTT_TOPIC = "vision/Corene/servo_control";
 const char* MQTT_CLIENT_ID_PREFIX = "corene-face-servo";
 
-const uint8_t SERVO_PIN = 15;  // D8 / GPIO15
+const uint8_t SERVO_PIN = 14;  // D14 / GPIO14
 
 const int SERVO_MIN_ANGLE = 0;
 const int SERVO_MAX_ANGLE = 180;
