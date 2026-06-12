@@ -1,0 +1,7 @@
+numpy
+opencv-python
+tqdm
+mediapipe
+onnxruntime
+scipy
+paho-mqtt

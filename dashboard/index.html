@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Corene — Face Tracking Control</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        :root {
+            --bg-0: #070b12;
+            --bg-1: #0d1420;
+            --bg-2: #141d2e;
+            --card: #111a28;
+            --card-border: rgba(120, 168, 255, 0.14);
+            --text: #e8eef8;
+            --muted: #7f92ad;
+            --accent: #3d9eff;
+            --accent-2: #ff6b4a;
+            --green: #2dd4a0;
+            --amber: #f5b942;
+            --red: #ff5c6a;
+            --steel: #5c6d88;
+            --mono: "JetBrains Mono", ui-monospace, monospace;
+            --sans: "DM Sans", system-ui, sans-serif;
+            --radius: 14px;
+            --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: var(--sans);
+            color: var(--text);
+            background:
+                radial-gradient(ellipse 80% 50% at 10% -10%, rgba(61, 158, 255, 0.18), transparent 55%),
+                radial-gradient(ellipse 60% 40% at 90% 0%, rgba(255, 107, 74, 0.12), transparent 50%),
+                linear-gradient(180deg, var(--bg-0), var(--bg-1) 40%, var(--bg-0));
+        }
+
+        .app {
+            width: min(1240px, calc(100% - 28px));
+            margin: 0 auto;
+            padding: 28px 0 40px;
+        }
+
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 20px;
+            margin-bottom: 22px;
+            flex-wrap: wrap;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .brand-mark {
+            width: 52px;
+            height: 52px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, var(--accent), #2563eb);
+            display: grid;
+            place-items: center;
+            font-family: var(--mono);
+            font-weight: 700;
+            font-size: 1.1rem;
+            color: #fff;
+            box-shadow: 0 8px 24px rgba(61, 158, 255, 0.35);
+        }
+
+        h1 {
+            margin: 0;
+            font-size: clamp(1.5rem, 3vw, 2.2rem);
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        .tagline {
+            margin: 4px 0 0;
+            color: var(--muted);
+            font-size: 0.92rem;
+        }
+
+        .tagline code {
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            color: var(--accent);
+            background: rgba(61, 158, 255, 0.1);
+            padding: 2px 8px;
+            border-radius: 6px;
+        }
+
+        .status-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 16px;
+            border-radius: 999px;
+            border: 1px solid var(--card-border);
+            background: rgba(255, 255, 255, 0.04);
+            font-family: var(--mono);
+            font-size: 0.78rem;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--steel);
+        }
+
+        .connected .status-dot { background: var(--green); box-shadow: 0 0 12px rgba(45, 212, 160, 0.55); }
+        .connecting .status-dot { background: var(--amber); animation: pulse 1.2s ease infinite; }
+        .offline .status-dot { background: var(--red); }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.45; }
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 1.35fr 0.65fr;
+            gap: 16px;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius);
+            padding: 20px;
+            box-shadow: var(--shadow);
+        }
+
+        .card-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 18px;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .command-stage {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 16px;
+            align-items: end;
+        }
+
+        .command-label {
+            color: var(--muted);
+            font-size: 0.85rem;
+            margin-bottom: 6px;
+        }
+
+        .command-value {
+            font-family: var(--mono);
+            font-size: clamp(2.8rem, 10vw, 5.5rem);
+            font-weight: 600;
+            line-height: 0.9;
+            letter-spacing: -0.03em;
+        }
+
+        .command-value.LEFT { color: var(--amber); }
+        .command-value.RIGHT { color: var(--accent); }
+        .command-value.CENTER { color: var(--green); }
+        .command-value.SEARCH { color: var(--red); }
+        .command-value.IDLE { color: var(--steel); }
+
+        .msg-badge {
+            text-align: right;
+            font-family: var(--mono);
+        }
+
+        .msg-badge span {
+            display: block;
+            color: var(--muted);
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+
+        .msg-badge strong {
+            font-size: 1.6rem;
+            color: var(--text);
+        }
+
+        .pan-rail {
+            position: relative;
+            height: 12px;
+            margin: 28px 0 8px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.06);
+            overflow: visible;
+        }
+
+        .pan-rail::before {
+            content: "";
+            position: absolute;
+            left: 50%;
+            top: -6px;
+            bottom: -6px;
+            width: 2px;
+            background: rgba(255, 255, 255, 0.2);
+            transform: translateX(-50%);
+        }
+
+        .pan-rail-labels {
+            display: flex;
+            justify-content: space-between;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            margin-bottom: 20px;
+        }
+
+        .pan-knob {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: var(--steel);
+            border: 3px solid var(--bg-1);
+            transform: translate(-50%, -50%);
+            transition: left 200ms ease, background 200ms ease;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+        }
+
+        .pan-knob.LEFT { left: 14%; background: var(--amber); }
+        .pan-knob.RIGHT { left: 86%; background: var(--accent); }
+        .pan-knob.CENTER { left: 50%; background: var(--green); }
+        .pan-knob.SEARCH { left: 50%; background: var(--red); animation: sweep 1.2s ease-in-out infinite; }
+        .pan-knob.IDLE { left: 50%; background: var(--steel); }
+
+        @keyframes sweep {
+            0%, 100% { left: 14%; }
+            50% { left: 86%; }
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 10px;
+        }
+
+        .stat {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 12px;
+            padding: 12px;
+            min-height: 78px;
+        }
+
+        .stat label {
+            display: block;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-bottom: 8px;
+        }
+
+        .stat strong {
+            display: block;
+            font-family: var(--mono);
+            font-size: 1.05rem;
+            overflow-wrap: anywhere;
+        }
+
+        .lock-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            height: 100%;
+        }
+
+        .lock-ring {
+            position: relative;
+            width: 120px;
+            height: 120px;
+            margin: 0 auto 4px;
+        }
+
+        .lock-ring svg {
+            width: 100%;
+            height: 100%;
+            transform: rotate(-90deg);
+        }
+
+        .lock-ring circle.track {
+            fill: none;
+            stroke: rgba(255, 255, 255, 0.08);
+            stroke-width: 8;
+        }
+
+        .lock-ring circle.fill {
+            fill: none;
+            stroke: var(--accent);
+            stroke-width: 8;
+            stroke-linecap: round;
+            stroke-dasharray: 283;
+            stroke-dashoffset: 283;
+            transition: stroke-dashoffset 400ms ease, stroke 300ms ease;
+        }
+
+        .lock-ring.locked circle.fill {
+            stroke: var(--green);
+            stroke-dashoffset: 0;
+        }
+
+        .lock-ring .center-text {
+            position: absolute;
+            inset: 0;
+            display: grid;
+            place-items: center;
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--muted);
+            text-align: center;
+            line-height: 1.3;
+        }
+
+        .lock-ring.locked .center-text {
+            color: var(--green);
+            font-weight: 600;
+        }
+
+        .target-block {
+            text-align: center;
+            padding: 12px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .target-block .label {
+            color: var(--muted);
+            font-size: 0.75rem;
+            margin-bottom: 4px;
+        }
+
+        .target-block .name {
+            font-size: 1.25rem;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+
+        .legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 4px;
+        }
+
+        .legend span {
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            color: var(--muted);
+        }
+
+        .legend .LEFT { border-color: rgba(245, 185, 66, 0.4); color: var(--amber); }
+        .legend .RIGHT { border-color: rgba(61, 158, 255, 0.4); color: var(--accent); }
+        .legend .CENTER { border-color: rgba(45, 212, 160, 0.4); color: var(--green); }
+        .legend .SEARCH { border-color: rgba(255, 92, 106, 0.4); color: var(--red); }
+
+        .controls {
+            display: grid;
+            gap: 10px;
+            margin-top: auto;
+        }
+
+        .field label {
+            display: block;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-bottom: 6px;
+        }
+
+        .field input {
+            width: 100%;
+            min-height: 40px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 9px 12px;
+            background: rgba(0, 0, 0, 0.25);
+            color: var(--text);
+            font-family: var(--mono);
+            font-size: 0.8rem;
+        }
+
+        .field input:focus {
+            outline: none;
+            border-color: rgba(61, 158, 255, 0.5);
+            box-shadow: 0 0 0 3px rgba(61, 158, 255, 0.15);
+        }
+
+        button {
+            min-height: 42px;
+            border: 0;
+            border-radius: 10px;
+            background: linear-gradient(135deg, var(--accent), #2563eb);
+            color: #fff;
+            font-family: var(--mono);
+            font-weight: 600;
+            font-size: 0.82rem;
+            cursor: pointer;
+            transition: filter 150ms ease, transform 150ms ease;
+        }
+
+        button:hover {
+            filter: brightness(1.1);
+            transform: translateY(-1px);
+        }
+
+        .log-card {
+            grid-column: 1 / -1;
+        }
+
+        .log-list {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            display: grid;
+            gap: 8px;
+            max-height: 280px;
+            overflow: auto;
+        }
+
+        .log-list li {
+            display: grid;
+            grid-template-columns: 88px 72px 1fr;
+            gap: 12px;
+            align-items: start;
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            font-family: var(--mono);
+            font-size: 0.76rem;
+        }
+
+        .log-list .time { color: var(--muted); }
+        .log-list .kind {
+            color: var(--accent);
+            text-transform: uppercase;
+            font-size: 0.68rem;
+            font-weight: 600;
+        }
+
+        .log-list .kind.movement { color: var(--amber); }
+        .log-list .kind.status { color: var(--green); }
+        .log-list .kind.error { color: var(--red); }
+
+        @media (max-width: 900px) {
+            .layout { grid-template-columns: 1fr; }
+            .stats { grid-template-columns: repeat(2, 1fr); }
+            .command-stage { grid-template-columns: 1fr; }
+        }
+
+        @media (max-width: 520px) {
+            .stats { grid-template-columns: 1fr; }
+            .log-list li { grid-template-columns: 1fr; gap: 4px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-mark">C</div>
+                <div>
+                    <h1>Corene Vision Control</h1>
+                    <p class="tagline">Single-speaker face lock &amp; servo tracking &mdash; <code>vision/Corene</code></p>
+                </div>
+            </div>
+            <div id="connectionChip" class="status-chip connecting">
+                <span class="status-dot"></span>
+                <span id="connectionText">Connecting</span>
+            </div>
+        </header>
+
+        <div class="layout">
+            <section class="card">
+                <div class="card-head">
+                    <span>Motor command</span>
+                    <span id="lastSeen">Waiting for data</span>
+                </div>
+
+                <div class="command-stage">
+                    <div>
+                        <div class="command-label">Current pan direction</div>
+                        <div id="movementValue" class="command-value IDLE">IDLE</div>
+                    </div>
+                    <div class="msg-badge">
+                        <span>Messages</span>
+                        <strong id="messageCount">0</strong>
+                    </div>
+                </div>
+
+                <div class="pan-rail" aria-hidden="true">
+                    <div id="servoKnob" class="pan-knob IDLE"></div>
+                </div>
+                <div class="pan-rail-labels">
+                    <span>LEFT</span>
+                    <span>CENTER</span>
+                    <span>RIGHT</span>
+                </div>
+
+                <div class="legend" aria-label="Command legend">
+                    <span class="LEFT">LEFT — face left of center</span>
+                    <span class="RIGHT">RIGHT — face right of center</span>
+                    <span class="CENTER">CENTER — aligned</span>
+                    <span class="SEARCH">SEARCH — re-acquire</span>
+                </div>
+
+                <div class="stats" style="margin-top: 18px;">
+                    <div class="stat">
+                        <label>Faces</label>
+                        <strong id="facesValue">0</strong>
+                    </div>
+                    <div class="stat">
+                        <label>Error X</label>
+                        <strong id="errorValue">0 px</strong>
+                    </div>
+                    <div class="stat">
+                        <label>Confidence</label>
+                        <strong id="confidenceValue">-</strong>
+                    </div>
+                    <div class="stat">
+                        <label>FPS</label>
+                        <strong id="fpsValue">-</strong>
+                    </div>
+                    <div class="stat">
+                        <label>Threshold</label>
+                        <strong id="thresholdValue">-</strong>
+                    </div>
+                </div>
+            </section>
+
+            <aside class="card lock-panel">
+                <div class="card-head">
+                    <span>Speaker lock</span>
+                    <span id="providerValue">-</span>
+                </div>
+
+                <div id="lockRing" class="lock-ring">
+                    <svg viewBox="0 0 100 100" aria-hidden="true">
+                        <circle class="track" cx="50" cy="50" r="45"></circle>
+                        <circle class="fill" cx="50" cy="50" r="45"></circle>
+                    </svg>
+                    <div id="lockCenterText" class="center-text">Unlocked</div>
+                </div>
+
+                <div class="target-block">
+                    <div class="label">Enrolled speaker</div>
+                    <div id="targetName" class="name">None</div>
+                </div>
+
+                <div class="controls">
+                    <div class="field">
+                        <label>MQTT WebSocket URL</label>
+                        <input id="wsUrlInput" type="text" value="ws://broker.hivemq.com:8000/mqtt">
+                    </div>
+                    <div class="field">
+                        <label>Movement topic</label>
+                        <input id="movementTopicInput" type="text" value="vision/Corene/movement">
+                    </div>
+                    <div class="field">
+                        <label>Status topic</label>
+                        <input id="statusTopicInput" type="text" value="vision/Corene/status">
+                    </div>
+                    <button id="connectButton" type="button">Reconnect</button>
+                </div>
+            </aside>
+
+            <section class="card log-card">
+                <div class="card-head">
+                    <span>Live event log</span>
+                    <span id="topicValue">vision/Corene/status</span>
+                </div>
+                <ul id="eventLog" class="log-list" role="log"></ul>
+            </section>
+        </div>
+    </div>
+
+    <script>
+        const MAX_LOG_ITEMS = 100;
+
+        const els = {
+            chip: document.getElementById("connectionChip"),
+            connectionText: document.getElementById("connectionText"),
+            lastSeen: document.getElementById("lastSeen"),
+            movementValue: document.getElementById("movementValue"),
+            servoKnob: document.getElementById("servoKnob"),
+            messageCount: document.getElementById("messageCount"),
+            facesValue: document.getElementById("facesValue"),
+            errorValue: document.getElementById("errorValue"),
+            confidenceValue: document.getElementById("confidenceValue"),
+            fpsValue: document.getElementById("fpsValue"),
+            thresholdValue: document.getElementById("thresholdValue"),
+            providerValue: document.getElementById("providerValue"),
+            lockRing: document.getElementById("lockRing"),
+            lockCenterText: document.getElementById("lockCenterText"),
+            targetName: document.getElementById("targetName"),
+            wsUrlInput: document.getElementById("wsUrlInput"),
+            movementTopicInput: document.getElementById("movementTopicInput"),
+            statusTopicInput: document.getElementById("statusTopicInput"),
+            connectButton: document.getElementById("connectButton"),
+            eventLog: document.getElementById("eventLog"),
+            topicValue: document.getElementById("topicValue"),
+        };
+
+        let client = null;
+        let messageCount = 0;
+        let movementTopic = els.movementTopicInput.value;
+        let statusTopic = els.statusTopicInput.value;
+        let lastStatusSeq = -1;
+        let lastStatusTimestamp = 0;
+        let lastStatusReceivedAt = 0;
+        let renderQueued = false;
+        let latestState = {
+            movement: "IDLE",
+            faces: 0,
+            error_x: 0,
+            confidence: null,
+            fps: null,
+            threshold: null,
+            provider: "-",
+            locked: false,
+            target: null,
+            locked_face_found: false,
+        };
+
+        function setConnectionState(state, text) {
+            els.chip.className = "status-chip " + state;
+            els.connectionText.textContent = text;
+        }
+
+        function connect() {
+            if (!window.mqtt) {
+                setConnectionState("offline", "MQTT.js missing");
+                addLog("system", "MQTT.js could not load");
+                return;
+            }
+
+            if (client) {
+                client.end(true);
+                client = null;
+            }
+
+            const wsUrl = els.wsUrlInput.value.trim();
+            movementTopic = els.movementTopicInput.value.trim();
+            statusTopic = els.statusTopicInput.value.trim();
+            els.topicValue.textContent = statusTopic;
+            lastStatusSeq = -1;
+            lastStatusTimestamp = 0;
+            lastStatusReceivedAt = 0;
+
+            setConnectionState("connecting", "Connecting");
+            addLog("system", "Connecting to " + wsUrl);
+
+            client = mqtt.connect(wsUrl, {
+                clientId: "corene-dashboard-" + Math.random().toString(16).slice(2),
+                clean: true,
+                keepalive: 30,
+                reconnectPeriod: 3000,
+                connectTimeout: 8000,
+            });
+
+            client.on("connect", () => {
+                setConnectionState("connected", "Live");
+                client.subscribe([movementTopic, statusTopic], { qos: 0 }, (err) => {
+                    if (err) addLog("error", "Subscribe failed");
+                    else addLog("system", "Subscribed to Corene topics");
+                });
+            });
+
+            client.on("reconnect", () => setConnectionState("connecting", "Reconnecting"));
+            client.on("close", () => setConnectionState("offline", "Offline"));
+            client.on("error", (err) => addLog("error", err.message || "MQTT error"));
+            client.on("message", handleMqttMessage);
+        }
+
+        function handleMqttMessage(topic, payloadBuffer) {
+            const payload = new TextDecoder().decode(payloadBuffer).trim();
+            messageCount += 1;
+            els.messageCount.textContent = String(messageCount);
+            els.lastSeen.textContent = "Updated " + new Date().toLocaleTimeString();
+
+            if (topic === movementTopic) {
+                handleRawMovement(payload);
+                return;
+            }
+
+            if (topic === statusTopic) {
+                try {
+                    updateStatus(JSON.parse(payload));
+                } catch {
+                    addLog("status", "Invalid JSON payload");
+                }
+            }
+        }
+
+        function handleRawMovement(payload) {
+            const statusIsFresh = Date.now() - lastStatusReceivedAt < 1500;
+            if (statusIsFresh) return;
+
+            const movement = normalizeMovement(payload);
+            if (movement !== latestState.movement) {
+                latestState = { ...latestState, movement };
+                queueRender();
+                addLog("movement", movement);
+            }
+        }
+
+        function updateStatus(status) {
+            const seq = Number(status.seq);
+            const timestamp = Number(status.timestamp || 0);
+            if (Number.isFinite(seq) && seq <= lastStatusSeq) return;
+            if (!Number.isFinite(seq) && timestamp > 0 && timestamp < lastStatusTimestamp) return;
+
+            if (Number.isFinite(seq)) lastStatusSeq = seq;
+            if (timestamp > 0) lastStatusTimestamp = timestamp;
+            lastStatusReceivedAt = Date.now();
+
+            const previousMovement = latestState.movement;
+            latestState = {
+                ...latestState,
+                movement: normalizeMovement(status.movement || latestState.movement),
+                faces: status.faces ?? latestState.faces,
+                error_x: status.error_x ?? latestState.error_x,
+                confidence: status.confidence ?? latestState.confidence,
+                fps: status.fps ?? latestState.fps,
+                threshold: status.threshold ?? latestState.threshold,
+                provider: status.provider || latestState.provider,
+                locked: Boolean(status.locked),
+                target: status.target || null,
+                locked_face_found: Boolean(status.locked_face_found),
+            };
+
+            queueRender();
+
+            if (latestState.movement !== previousMovement || messageCount % 25 === 0) {
+                const conf = latestState.confidence != null ? ` conf=${formatNumber(latestState.confidence, 3)}` : "";
+                const found = latestState.locked_face_found ? "visible" : "lost";
+                addLog(
+                    "status",
+                    `${latestState.movement} | ${latestState.locked ? latestState.target || "locked" : "unlocked"} | ${found}${conf}`
+                );
+            }
+        }
+
+        function queueRender() {
+            if (renderQueued) return;
+            renderQueued = true;
+            requestAnimationFrame(() => {
+                renderQueued = false;
+                renderState();
+            });
+        }
+
+        function renderState() {
+            setMovement(latestState.movement);
+
+            els.facesValue.textContent = String(latestState.faces ?? 0);
+            els.errorValue.textContent = formatNumber(latestState.error_x, 1) + " px";
+            els.confidenceValue.textContent =
+                latestState.confidence == null ? "-" : formatNumber(latestState.confidence, 3);
+            els.fpsValue.textContent = latestState.fps == null ? "-" : formatNumber(latestState.fps, 1);
+            els.thresholdValue.textContent =
+                latestState.threshold == null ? "-" : formatNumber(latestState.threshold, 3);
+            els.providerValue.textContent = latestState.provider || "-";
+
+            const locked = Boolean(latestState.locked);
+            els.lockRing.classList.toggle("locked", locked);
+            els.lockCenterText.textContent = locked ? "Locked" : "Unlocked";
+            els.targetName.textContent = latestState.target || "None";
+        }
+
+        function setMovement(command) {
+            const known = normalizeMovement(command);
+            els.movementValue.textContent = known;
+            els.movementValue.className = "command-value " + known;
+            els.servoKnob.className = "pan-knob " + known;
+        }
+
+        function normalizeMovement(command) {
+            const clean = String(command || "IDLE").toUpperCase();
+            return ["LEFT", "RIGHT", "CENTER", "SEARCH", "IDLE"].includes(clean) ? clean : "IDLE";
+        }
+
+        function addLog(kind, text) {
+            const item = document.createElement("li");
+            const stamp = document.createElement("span");
+            const tag = document.createElement("span");
+            const body = document.createElement("span");
+            stamp.className = "time";
+            tag.className = "kind " + kind;
+            stamp.textContent = new Date().toLocaleTimeString();
+            tag.textContent = kind;
+            body.textContent = text;
+            item.append(stamp, tag, body);
+            els.eventLog.prepend(item);
+            while (els.eventLog.children.length > MAX_LOG_ITEMS) {
+                els.eventLog.removeChild(els.eventLog.lastChild);
+            }
+        }
+
+        function formatNumber(value, digits) {
+            const num = Number(value);
+            if (!Number.isFinite(num)) return "0";
+            return num.toFixed(digits);
+        }
+
+        els.connectButton.addEventListener("click", connect);
+        connect();
+    </script>
+</body>
+</html>
