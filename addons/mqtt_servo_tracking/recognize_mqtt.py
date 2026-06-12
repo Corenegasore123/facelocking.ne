@@ -1878,6 +1878,7 @@ def main():
                     "recognized_faces": frame_match_records,
                     "locked_face_bbox": locked_face_bbox,
                     "motor_command": movement_command,
+                    "assessment_command": assessment_command_for(movement_command),
                     "tracking_zone": tracking_zone,
                     "horizontal_error_px": round(float(movement_error_x), 2),
                     "raw_horizontal_error_px": round(float(raw_movement_error_x), 2),
@@ -2039,24 +2040,27 @@ def main():
             elif key == ord("d"):  # Toggle debug
                 show_debug = not show_debug
                 print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
-            elif key == ord('l'):  # Lock/unlock face
-                if face_lock:  # Unlock if already locked
-                    save_action_history(face_lock.target_name, face_lock.history)
-                    print(f"[FaceLock] Unlocked {face_lock.target_name}")
-                    face_lock = None
-                    selected_face_index = None
-                    potential_face_to_lock = None
-                    filtered_error_x = None
-                    stable_track_command = MOVEMENT_CENTER
-                    visible_movement_command = MOVEMENT_IDLE
-                    visible_command_changed_at = current_time
-                    pending_track_command = None
-                    pending_track_count = 0
-                    face_missing_since = None
-                    reacquire_hold_until = 0.0
-                    scan_started_logged = False
-                    if mqtt_publisher is not None:
-                        mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
+            elif key in (ord("l"), ord("u")):  # Lock/unlock speaker
+                if face_lock:
+                    unlock_state = unlock_speaker(
+                        face_lock,
+                        current_time,
+                        "Manual unlock",
+                        mqtt_publisher,
+                    )
+                    face_lock = unlock_state["face_lock"]
+                    selected_face_index = unlock_state["selected_face_index"]
+                    potential_face_to_lock = unlock_state["potential_face_to_lock"]
+                    filtered_error_x = unlock_state["filtered_error_x"]
+                    stable_track_command = unlock_state["stable_track_command"]
+                    visible_movement_command = unlock_state["visible_movement_command"]
+                    visible_command_changed_at = unlock_state["visible_command_changed_at"]
+                    pending_track_command = unlock_state["pending_track_command"]
+                    pending_track_count = unlock_state["pending_track_count"]
+                    face_missing_since = unlock_state["face_missing_since"]
+                    reacquire_hold_until = unlock_state["reacquire_hold_until"]
+                    scan_started_logged = unlock_state["scan_started_logged"]
+                    searching_for_target = unlock_state["searching_for_target"]
                 # Only allow locking if we have a selected recognized face
                 elif potential_face_to_lock and potential_face_to_lock[0] is not None:
                     name, emb, kps = potential_face_to_lock
