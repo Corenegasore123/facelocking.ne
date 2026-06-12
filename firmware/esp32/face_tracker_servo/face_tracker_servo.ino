@@ -31,7 +31,7 @@ const uint8_t MQTT_FALLBACK_IP_COUNT =
 // =========================
 // Servo Configuration
 // =========================
-const uint8_t SERVO_PIN = 18;
+const uint8_t SERVO_PIN = 14;
 
 const int SERVO_MIN_ANGLE = 0;
 const int SERVO_MAX_ANGLE = 180;
