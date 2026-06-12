@@ -20,6 +20,7 @@ FaceLocking/
 ├── firmware/esp32/face_tracker/  # ESP32 sketch + upload.ps1
 ├── dashboard/index.html
 ├── data/db | enroll | logs
+├── diagrams/pipeline_flowchart.mmd
 ├── models/
 └── scripts/init_project.py
 ```
@@ -54,7 +55,8 @@ powershell -ExecutionPolicy Bypass -File firmware/esp32/upload.ps1 -Port COM5
 ## MQTT (`config/corene.py`)
 
 Broker `157.173.101.159:1883` · topic `vision/Corene/servo_control`  
-Commands: `MOVED_LEFT`, `MOVED_RIGHT`, `CENTERED`, `SEARCHING`, `STOPPED`
+Commands: `MOVED_LEFT`, `MOVED_RIGHT`, `CENTERED`, `SEARCHING`, `OUT_OF_FRAME`, `STOPPED`  
+Heartbeat: `vision/Corene/heartbeat` every 30s
 
 ## Keys
 

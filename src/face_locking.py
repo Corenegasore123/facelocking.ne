@@ -486,7 +486,9 @@ MOVEMENT_LEFT = cfg.cmd_left
 MOVEMENT_RIGHT = cfg.cmd_right
 MOVEMENT_CENTER = cfg.cmd_center
 MOVEMENT_SEARCH = cfg.cmd_search
+MOVEMENT_OUT_OF_FRAME = cfg.cmd_out_of_frame
 MOVEMENT_IDLE = cfg.cmd_stop
+SEARCH_MOVEMENT_COMMANDS = frozenset({MOVEMENT_SEARCH, MOVEMENT_OUT_OF_FRAME})
 TRACK_MOVEMENT_COMMANDS = frozenset({
     MOVEMENT_LEFT,
     MOVEMENT_RIGHT,
@@ -603,12 +605,14 @@ class MqttMovementPublisher:
         broker_port: int,
         topic: str,
         status_topic: str,
+        heartbeat_topic: str,
         client_id: str,
         min_publish_interval: float = 0.15,
         status_min_publish_interval: float = 0.25,
     ):
         self.topic = topic
         self.status_topic = status_topic
+        self.heartbeat_topic = heartbeat_topic
         self.min_publish_interval = float(max(0.0, min_publish_interval))
         self.status_min_publish_interval = float(max(0.0, status_min_publish_interval))
         self.last_command: Optional[str] = None
@@ -632,6 +636,7 @@ class MqttMovementPublisher:
             print(f"[MQTT] Connected to broker")
             print(f"[MQTT] Movement topic: {self.topic}")
             print(f"[MQTT] Status topic: {self.status_topic}")
+            print(f"[MQTT] Heartbeat topic: {self.heartbeat_topic}")
         else:
             print(f"[MQTT] Connect failed with code {rc}")
 
@@ -680,6 +685,21 @@ class MqttMovementPublisher:
         info = self.client.publish(self.status_topic, payload=payload, qos=0, retain=False)
         if info.rc == mqtt.MQTT_ERR_SUCCESS:
             self.last_status_publish_at = now
+
+    def publish_heartbeat(self, speaker_id: Optional[str] = None, force: bool = False) -> None:
+        if not self.connected:
+            return
+        payload = json.dumps(
+            {
+                "node": "pc",
+                "team": cfg.team_id,
+                "status": "ONLINE",
+                "speaker_id": speaker_id or "none",
+                "timestamp": int(time.time()),
+            },
+            separators=(",", ":"),
+        )
+        self.client.publish(self.heartbeat_topic, payload=payload, qos=0, retain=False)
 
     def close(self):
         try:
@@ -780,6 +800,18 @@ def parse_args() -> argparse.Namespace:
         help="After re-acquiring the speaker, block SEARCHING for this many seconds.",
     )
     parser.add_argument(
+        "--out-of-frame-frames",
+        type=int,
+        default=cfg.out_of_frame_miss_frames,
+        help="Frames without the locked speaker during search before publishing OUT_OF_FRAME.",
+    )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=cfg.heartbeat_interval_sec,
+        help="Seconds between MQTT heartbeat publishes on vision/Corene/heartbeat.",
+    )
+    parser.add_argument(
         "--mqtt-min-interval",
         type=float,
         default=cfg.track_publish_interval_sec,
@@ -837,6 +869,8 @@ def main():
     args.search_missing_frames = int(max(1, args.search_missing_frames))
     args.reacquire_frames = int(max(1, args.reacquire_frames))
     args.search_cooldown_sec = float(max(0.0, args.search_cooldown_sec))
+    args.out_of_frame_frames = int(max(1, args.out_of_frame_frames))
+    args.heartbeat_interval = float(max(5.0, args.heartbeat_interval))
     args.mqtt_min_interval = float(max(0.0, args.mqtt_min_interval))
     args.mqtt_status_min_interval = float(max(0.0, args.mqtt_status_min_interval))
     args.center_exit_hysteresis_px = float(max(0.0, args.center_exit_hysteresis_px))
@@ -948,7 +982,9 @@ def main():
     locks_missing_streak = 0
     search_cooldown_until = 0.0
     search_active = False
+    out_of_frame_reported = False
     last_locked_center: Optional[Tuple[float, float]] = None
+    last_heartbeat_at = time.time()
     mqtt_publisher: Optional[MqttMovementPublisher] = None
     operational_logger = OperationalLogger(Path(args.evidence_log), args.mqtt_topic)
 
@@ -963,11 +999,13 @@ def main():
                 broker_port=args.mqtt_port,
                 topic=args.mqtt_topic,
                 status_topic=args.mqtt_status_topic,
+                heartbeat_topic=cfg.heartbeat_topic,
                 client_id=args.mqtt_client_id,
                 min_publish_interval=args.mqtt_min_interval,
                 status_min_publish_interval=args.mqtt_status_min_interval,
             )
             mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
+            mqtt_publisher.publish_heartbeat(speaker_id=target_speaker, force=True)
         except Exception as e:
             print(f"[MQTT] Failed to initialize publisher: {e}")
             mqtt_publisher = None
@@ -1032,6 +1070,7 @@ def main():
                 locks_missing_streak = 0
                 search_cooldown_until = 0.0
                 search_active = False
+                out_of_frame_reported = False
                 last_locked_center = None
                 if mqtt_publisher is not None:
                     mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
@@ -1242,6 +1281,7 @@ def main():
                 if search_active:
                     reacquired_from_search = True
                     search_active = False
+                    out_of_frame_reported = False
                     search_cooldown_until = current_time + args.search_cooldown_sec
                     filtered_error_x = None
                     stable_track_command = MOVEMENT_CENTER
@@ -1301,8 +1341,19 @@ def main():
                     and lost_for >= args.search_delay_sec
                     and current_time >= search_cooldown_until
                 ):
-                    movement_command = MOVEMENT_SEARCH
                     search_active = True
+                    if locks_missing_streak >= args.out_of_frame_frames:
+                        movement_command = MOVEMENT_OUT_OF_FRAME
+                        if not out_of_frame_reported:
+                            out_of_frame_reported = True
+                            face_lock.history.append(Action(
+                                ActionType.FACE_LOST,
+                                current_time,
+                                f"Speaker out of frame ({locks_missing_streak} frames); search continues",
+                            ))
+                            print("[FaceLock] OUT_OF_FRAME — pan search continues.")
+                    else:
+                        movement_command = MOVEMENT_SEARCH
                 else:
                     movement_command = MOVEMENT_IDLE
                 movement_error_x = 0.0
@@ -1331,14 +1382,20 @@ def main():
 
             if mqtt_publisher is not None:
                 leaving_search = (
-                    prev_movement_command == MOVEMENT_SEARCH
-                    and movement_command != MOVEMENT_SEARCH
+                    prev_movement_command in SEARCH_MOVEMENT_COMMANDS
+                    and movement_command not in SEARCH_MOVEMENT_COMMANDS
                 )
                 mqtt_publisher.publish(
                     movement_command,
                     force=leaving_search or reacquired_from_search,
                 )
                 mqtt_publisher.publish_status(status_payload)
+                if current_time - last_heartbeat_at >= args.heartbeat_interval:
+                    mqtt_publisher.publish_heartbeat(
+                        speaker_id=face_lock.target_name if face_lock else target_speaker,
+                        force=True,
+                    )
+                    last_heartbeat_at = current_time
             prev_movement_command = movement_command
             
             # Draw UI elements with proper spacing and modern styling
@@ -1467,6 +1524,7 @@ def main():
                     locks_missing_streak = 0
                     search_cooldown_until = 0.0
                     search_active = False
+                    out_of_frame_reported = False
                     last_locked_center = None
                     if mqtt_publisher is not None:
                         mqtt_publisher.publish(MOVEMENT_IDLE, force=True)

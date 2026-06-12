@@ -79,6 +79,9 @@ def main() -> int:
     dashboard_html = cfg.models_dir.parent / "dashboard" / "index.html"
     all_ok &= check("Dashboard UI", dashboard_html.exists(), str(dashboard_html))
 
+    flowchart = cfg.models_dir.parent / "diagrams" / "pipeline_flowchart.mmd"
+    all_ok &= check("Pipeline flowchart", flowchart.exists(), str(flowchart))
+
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     all_ok &= check("Evidence log directory", cfg.logs_dir.exists(), str(cfg.logs_dir))
 

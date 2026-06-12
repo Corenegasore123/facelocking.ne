@@ -1,0 +1,35 @@
+flowchart TD
+    A[USB Camera Frame] --> B[Haar Face Detection]
+    B --> C{Face detected?}
+    C -->|No| D{Speaker locked?}
+    C -->|Yes| E[FaceMesh 5pt + Align 112x112]
+    E --> F[ArcFace Embedding]
+    F --> G{Matches enrolled speaker?}
+    G -->|No| H[Ignore other faces]
+    G -->|Yes| I{Locked on speaker?}
+    I -->|No| J[Auto-lock or manual lock]
+    I -->|Yes| K[Compute horizontal error vs frame center]
+    K --> L{Within deadzone?}
+    L -->|Yes| M[Publish CENTERED]
+    L -->|No| N{Error left or right?}
+    N -->|Left| O[Publish MOVED_LEFT]
+    N -->|Right| P[Publish MOVED_RIGHT]
+    D -->|Yes, lost briefly| Q[Publish STOPPED hold]
+    D -->|Yes, lost longer| R[Publish SEARCHING]
+    R --> S{Still missing many frames?}
+    S -->|Yes| T[Publish OUT_OF_FRAME search continues]
+    S -->|No| R
+    T --> U{Speaker reacquired?}
+    R --> U
+    U -->|Yes| V[Publish STOPPED then track]
+    U -->|No| R
+    M --> W[MQTT vision/Corene/servo_control]
+    O --> W
+    P --> W
+    Q --> W
+    R --> W
+    T --> W
+    V --> W
+    W --> X[ESP32 GPIO14 Servo]
+    W --> Y[Status JSON vision/Corene/status]
+    W --> Z[Heartbeat vision/Corene/heartbeat]

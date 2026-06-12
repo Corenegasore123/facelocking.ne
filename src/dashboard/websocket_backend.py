@@ -48,8 +48,15 @@ async def _async_broadcast(message: str) -> None:
 
 def on_connect(client, _userdata, _flags, rc, _properties=None):
     if rc == 0:
-        client.subscribe([(cfg.movement_topic, 0), (cfg.status_topic, 0)])
-        print(f"MQTT connected — subscribed to {cfg.movement_topic} and {cfg.status_topic}")
+        client.subscribe([
+            (cfg.movement_topic, 0),
+            (cfg.status_topic, 0),
+            (cfg.heartbeat_topic, 0),
+        ])
+        print(
+            f"MQTT connected — subscribed to {cfg.movement_topic}, "
+            f"{cfg.status_topic}, {cfg.heartbeat_topic}"
+        )
     else:
         print(f"MQTT connect failed: rc={rc}")
 

@@ -38,7 +38,9 @@ class CoreneConfig:
     cmd_right: str = "MOVED_RIGHT"
     cmd_center: str = "CENTERED"
     cmd_search: str = "SEARCHING"
+    cmd_out_of_frame: str = "OUT_OF_FRAME"
     cmd_stop: str = "STOPPED"
+    heartbeat_interval_sec: float = 30.0
 
     # Tracking (aligned with stable Pascaline-style behaviour)
     match_threshold: float = 0.40
@@ -52,6 +54,7 @@ class CoreneConfig:
     reacquire_frames: int = 5
     search_delay_sec: float = 0.3
     search_cooldown_sec: float = 2.0
+    out_of_frame_miss_frames: int = 30
     unlock_timeout_sec: float = 40.0
 
     # ESP32
