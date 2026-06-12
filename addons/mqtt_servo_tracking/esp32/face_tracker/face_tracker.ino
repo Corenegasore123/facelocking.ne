@@ -12,8 +12,8 @@
 #include <PubSubClient.h>
 #include <ESP32Servo.h>
 
-const char* WIFI_SSID = "RCA-OUTDOR";
-const char* WIFI_PASSWORD = "@mindurbusiness";
+const char* WIFI_SSID = "EdNet";
+const char* WIFI_PASSWORD = "Huawei@123";
 
 const char* MQTT_SERVER = "157.173.101.159";
 const uint16_t MQTT_PORT = 1883;
