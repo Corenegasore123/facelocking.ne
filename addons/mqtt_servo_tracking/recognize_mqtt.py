@@ -766,8 +766,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-delay-sec",
         type=float,
-        default=0.0,
-        help="Delay before sending SEARCHING after the locked face is temporarily lost.",
+        default=0.3,
+        help="Extra seconds after face loss before SEARCHING is allowed.",
+    )
+    parser.add_argument(
+        "--search-missing-frames",
+        type=int,
+        default=12,
+        help="Consecutive frames without the locked speaker before SEARCHING starts.",
+    )
+    parser.add_argument(
+        "--reacquire-frames",
+        type=int,
+        default=5,
+        help="Consecutive frames with the locked speaker before search stops and tracking resumes.",
+    )
+    parser.add_argument(
+        "--search-cooldown-sec",
+        type=float,
+        default=2.0,
+        help="After re-acquiring the speaker, block SEARCHING for this many seconds.",
     )
     parser.add_argument(
         "--mqtt-min-interval",
@@ -824,6 +842,9 @@ def main():
     args.error_smooth_alpha = float(max(0.01, min(1.0, args.error_smooth_alpha)))
     args.command_confirm_frames = int(max(1, args.command_confirm_frames))
     args.search_delay_sec = float(max(0.0, args.search_delay_sec))
+    args.search_missing_frames = int(max(1, args.search_missing_frames))
+    args.reacquire_frames = int(max(1, args.reacquire_frames))
+    args.search_cooldown_sec = float(max(0.0, args.search_cooldown_sec))
     args.mqtt_min_interval = float(max(0.0, args.mqtt_min_interval))
     args.mqtt_status_min_interval = float(max(0.0, args.mqtt_status_min_interval))
     args.center_exit_hysteresis_px = float(max(0.0, args.center_exit_hysteresis_px))
@@ -923,6 +944,9 @@ def main():
     pending_track_command: Optional[str] = None
     pending_track_count = 0
     face_missing_since: Optional[float] = None
+    locks_found_streak = 0
+    locks_missing_streak = 0
+    search_cooldown_until = 0.0
     mqtt_publisher: Optional[MqttMovementPublisher] = None
     operational_logger = OperationalLogger(Path(args.evidence_log), args.mqtt_topic)
 
@@ -1002,6 +1026,9 @@ def main():
                 pending_track_command = None
                 pending_track_count = 0
                 face_missing_since = None
+                locks_found_streak = 0
+                locks_missing_streak = 0
+                search_cooldown_until = 0.0
                 if mqtt_publisher is not None:
                     mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
             
@@ -1179,17 +1206,33 @@ def main():
                     dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
                     draw_text_with_shadow(vis, dbg, (10, h - 20), 0.65, (255, 255, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
 
+            if face_lock and locked_face_found:
+                locks_found_streak += 1
+                locks_missing_streak = 0
+            elif face_lock:
+                locks_missing_streak += 1
+                locks_found_streak = 0
+
+            speaker_visible = (
+                face_lock is not None
+                and locks_found_streak >= args.reacquire_frames
+                and locked_face_kps is not None
+            )
+            speaker_missing = (
+                face_lock is not None
+                and locks_missing_streak >= args.search_missing_frames
+            )
+
             # Movement command for ESP servo.
-            # Track left/right while the locked speaker is visible; sweep/search when missing.
-            just_reacquired = False
-            if face_lock and locked_face_found and locked_face_kps is not None:
-                just_reacquired = face_missing_since is not None
-                face_missing_since = None
-                if just_reacquired:
+            # Track left/right while the locked speaker is stably visible; sweep/search when missing.
+            if speaker_visible:
+                if prev_movement_command == MOVEMENT_SEARCH:
+                    search_cooldown_until = current_time + args.search_cooldown_sec
                     filtered_error_x = None
                     stable_track_command = MOVEMENT_CENTER
                     pending_track_command = None
                     pending_track_count = 0
+                face_missing_since = None
                 raw_error_x = compute_face_error_x(locked_face_kps, frame_width=w)
                 if filtered_error_x is None:
                     filtered_error_x = raw_error_x
@@ -1221,23 +1264,28 @@ def main():
                         pending_track_command = None
                         pending_track_count = 0
 
-                if just_reacquired:
-                    movement_command = MOVEMENT_IDLE
-                else:
-                    movement_command = stable_track_command
+                movement_command = stable_track_command
             elif face_lock:
-                if face_missing_since is None:
+                if locks_missing_streak == 1:
                     face_missing_since = current_time
                     face_lock.history.append(Action(
                         ActionType.FACE_LOST,
                         current_time,
                         "Speaker temporarily out of frame or occluded",
                     ))
-                lost_for = current_time - face_missing_since
-                if lost_for < args.search_delay_sec:
-                    movement_command = MOVEMENT_IDLE
-                else:
+                lost_for = (
+                    current_time - face_missing_since
+                    if face_missing_since is not None
+                    else 0.0
+                )
+                if (
+                    speaker_missing
+                    and lost_for >= args.search_delay_sec
+                    and current_time >= search_cooldown_until
+                ):
                     movement_command = MOVEMENT_SEARCH
+                else:
+                    movement_command = MOVEMENT_IDLE
                 movement_error_x = 0.0
             else:
                 filtered_error_x = None
@@ -1269,7 +1317,7 @@ def main():
                 )
                 mqtt_publisher.publish(
                     movement_command,
-                    force=just_reacquired or leaving_search,
+                    force=leaving_search,
                 )
                 mqtt_publisher.publish_status(status_payload)
             prev_movement_command = movement_command
@@ -1396,6 +1444,9 @@ def main():
                     pending_track_command = None
                     pending_track_count = 0
                     face_missing_since = None
+                    locks_found_streak = 0
+                    locks_missing_streak = 0
+                    search_cooldown_until = 0.0
                     if mqtt_publisher is not None:
                         mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
                 # Only allow locking if we have a selected recognized face

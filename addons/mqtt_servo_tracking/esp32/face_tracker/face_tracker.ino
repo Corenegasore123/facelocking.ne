@@ -111,6 +111,9 @@ void applyIncomingCommand(MovementCommand newCommand) {
   }
   currentCommand = newCommand;
   lastCommandAt = millis();
+  if (newCommand == CMD_IDLE || newCommand == CMD_CENTER) {
+    panServo.write(servoAngle);
+  }
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
