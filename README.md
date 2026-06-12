@@ -52,7 +52,7 @@ Tracker controls: `l` / `u` lock/unlock, `q` quit, `d` debug, `+`/`-` threshold.
 - `MOVED_LEFT` — speaker left of center  
 - `MOVED_RIGHT` — speaker right of center  
 - `CENTERED` — speaker centered  
-- `OUT_OF_FRAME` — speaker lost, pan search  
+- `SEARCHING` — speaker lost, pan search  
 - `STOPPED` — hold / unlocked  
 
 ESP32 firmware accepts these plus internal aliases (`LEFT`, `SEARCH`, etc.).
@@ -73,7 +73,7 @@ Disable CSV: `--disable-csv-log`. Interval: `--log-interval 0.25`.
 
 1. Auto-lock onto enrolled speaker when seen.  
 2. Track with `MOVED_LEFT` / `MOVED_RIGHT` / `CENTERED`.  
-3. On loss → `OUT_OF_FRAME` search immediately.  
+3. On loss → `SEARCHING` sweep immediately.  
 4. On reacquire → stop search and track again.  
 5. Unlock: manual (`l`/`u`), `--unlock-timeout-sec 40`, or `--search-unlock-sec 30`.
 
@@ -86,7 +86,7 @@ Open `diagrams/pipeline_flowchart.mmd` in [mermaid.live](https://mermaid.live) o
 1. Open `addons/mqtt_servo_tracking/esp32/face_tracker/face_tracker.ino`  
 2. Set `WIFI_SSID` / `WIFI_PASSWORD`  
 3. Confirm `MQTT_SERVER = "157.173.101.159"`  
-4. Wire servo signal → **D14**, power → **5 V**, GND → common ground  
+4. Wire servo signal → **D8 (GPIO15)**, power → **5 V**, GND → common ground (WiFi defaults: `RCA-OUTDOR`)  
 5. Upload (re-flash after any firmware change):
 
 ```powershell
@@ -107,7 +107,7 @@ Open `dashboard/index.html`. Default WebSocket: `ws://157.173.101.159:9001`.
 | Speaker lock, ignore others | `recognize_mqtt.py` |
 | Recognize → Track → Command flowchart | `diagrams/pipeline_flowchart.mmd` |
 | BENAX MQTT commands | Published on movement topic |
-| Re-acquisition / search | `OUT_OF_FRAME` + unlock rules |
+| Re-acquisition / search | `SEARCHING` + unlock rules |
 | CSV + JSON evidence logs | `logs/session_*.csv` + `logs/evidence/` |
 | ESP embedded MQTT subscriber | ESP32 firmware (ESP8266-compatible protocol) |
 | Power / safety documentation | `docs/POWER_AND_SAFETY.md` |

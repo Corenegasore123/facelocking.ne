@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, TextIO, Tuple
+from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -68,9 +68,6 @@ class FaceDet:
 class ActionType(Enum):
     FACE_LOCKED = auto()
     FACE_LOST = auto()
-    FACE_REACQUIRED = auto()
-    FACE_UNLOCKED = auto()
-    SCAN_STARTED = auto()
 
 @dataclass
 class Action:
@@ -83,16 +80,13 @@ class FaceLock:
     target_name: str
     target_emb: np.ndarray
     last_seen: float = field(default_factory=time.time)
-    last_position: Optional[Tuple[float, float]] = None
     history: List[Action] = field(default_factory=list)
     consecutive_frames: int = 0
-
-    def update_position(self, kps: np.ndarray) -> None:
-        center_x = float(kps[:, 0].mean())
-        center_y = float(kps[:, 1].mean())
-        self.last_position = (center_x, center_y)
+    
+    def update_position(self, kps: np.ndarray) -> List[Action]:
         self.last_seen = time.time()
         self.consecutive_frames += 1
+        return []
 
 @dataclass
 class MatchResult:
@@ -100,16 +94,6 @@ class MatchResult:
     distance: float
     similarity: float
     accepted: bool
-
-@dataclass
-class CachedFace:
-    emb: Optional[np.ndarray] = None
-    match: Optional[MatchResult] = None
-    label_history: List[str] = field(default_factory=list)
-    embedding_history: List[np.ndarray] = field(default_factory=list)
-    stable_label: str = "Unknown"
-    aligned: Optional[np.ndarray] = None
-    last_recognized_frame: int = -9999
 
 # -------------------------
 # Math helpers
@@ -208,13 +192,24 @@ class ArcFaceEmbedderONNX:
         if providers is None:
             providers = ["CPUExecutionProvider"]
         self.sess = ort.InferenceSession(model_path, providers=providers)
-        self.in_name = self.sess.get_inputs()[0].name
+        model_input = self.sess.get_inputs()[0]
+        self.in_name = model_input.name
         self.out_name = self.sess.get_outputs()[0].name
+        self.input_layout = self._detect_input_layout(model_input.shape)
         if self.debug:
             print("[embed] model:", model_path)
             print("[embed] providers:", self.sess.get_providers())
-            print("[embed] input:", self.sess.get_inputs()[0].name, self.sess.get_inputs()[0].shape, self.sess.get_inputs()[0].type)
+            print("[embed] input:", model_input.name, model_input.shape, model_input.type, self.input_layout)
             print("[embed] output:", self.sess.get_outputs()[0].name, self.sess.get_outputs()[0].shape, self.sess.get_outputs()[0].type)
+
+    @staticmethod
+    def _detect_input_layout(shape) -> str:
+        if len(shape) == 4:
+            if shape[1] == 3:
+                return "NCHW"
+            if shape[3] == 3:
+                return "NHWC"
+        return "NHWC"
 
     def _preprocess(self, aligned_bgr_112: np.ndarray) -> np.ndarray:
         img = aligned_bgr_112
@@ -222,7 +217,10 @@ class ArcFaceEmbedderONNX:
             img = cv2.resize(img, (self.in_w, self.in_h), interpolation=cv2.INTER_LINEAR)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
         rgb = (rgb - 127.5) / 128.0
-        x = rgb[None, ...]
+        if self.input_layout == "NCHW":
+            x = np.transpose(rgb, (2, 0, 1))[None, ...]
+        else:
+            x = rgb[None, ...]
         return x.astype(np.float32)
 
     @staticmethod
@@ -246,14 +244,10 @@ class HaarFaceMesh5pt:
         haar_xml: Optional[str] = None,
         model_path: str = "models/face_landmarker.task",
         min_size: Tuple[int, int] = (70, 70),
-        haar_scale: float = 0.5,
-        landmark_roi_width: int = 224,
         debug: bool = False,
     ):
         self.debug = bool(debug)
         self.min_size = tuple(map(int, min_size))
-        self.haar_scale = float(min(1.0, max(0.2, haar_scale)))
-        self.landmark_roi_width = int(max(80, landmark_roi_width))
         if haar_xml is None:
             haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         self.face_cascade = cv2.CascadeClassifier(haar_xml)
@@ -288,43 +282,22 @@ class HaarFaceMesh5pt:
         self.IDX_MOUTH_RIGHT = 291
 
     def _haar_faces(self, gray: np.ndarray) -> np.ndarray:
-        scale = self.haar_scale
-        detect_gray = gray
-        min_size = self.min_size
-        if scale < 0.999:
-            detect_gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            min_size = (
-                max(20, int(round(self.min_size[0] * scale))),
-                max(20, int(round(self.min_size[1] * scale))),
-            )
-
         faces = self.face_cascade.detectMultiScale(
-            detect_gray,
+            gray,
             scaleFactor=1.1,
             minNeighbors=5,
             flags=cv2.CASCADE_SCALE_IMAGE,
-            minSize=min_size,
+            minSize=self.min_size,
         )
         if faces is None or len(faces) == 0:
             return np.zeros((0, 4), dtype=np.int32)
-        faces = faces.astype(np.float32)
-        if scale < 0.999:
-            faces /= scale
-        return np.round(faces).astype(np.int32) # (x,y,w,h)
+        return faces.astype(np.int32) # (x,y,w,h)
 
     def _roi_facemesh_5pt(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
         H, W = roi_bgr.shape[:2]
         if H < 20 or W < 20:
             return None
-        scale_back = 1.0
-        roi_for_mesh = roi_bgr
-        if W > self.landmark_roi_width:
-            scale_back = W / float(self.landmark_roi_width)
-            new_h = max(20, int(round(H / scale_back)))
-            roi_for_mesh = cv2.resize(roi_bgr, (self.landmark_roi_width, new_h), interpolation=cv2.INTER_AREA)
-
-        mesh_h, mesh_w = roi_for_mesh.shape[:2]
-        rgb = cv2.cvtColor(roi_for_mesh, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         res = self.detector.detect(mp_image)
         
@@ -336,7 +309,7 @@ class HaarFaceMesh5pt:
         pts = []
         for i in idxs:
             p = lm[i]
-            pts.append([p.x * mesh_w * scale_back, p.y * mesh_h * scale_back])
+            pts.append([p.x * W, p.y * H])
         kps = np.array(pts, dtype=np.float32)
         # enforce left/right ordering
         if kps[0, 0] > kps[1, 0]:
@@ -514,104 +487,22 @@ def draw_text_box(
     
     return (text_width + padding * 2, text_height + padding * 2 + baseline)
 
-
-def draw_translucent_rect(
-    img: np.ndarray,
-    top_left: Tuple[int, int],
-    bottom_right: Tuple[int, int],
-    color: Tuple[int, int, int],
-    alpha: float,
-) -> None:
-    overlay = img.copy()
-    cv2.rectangle(overlay, top_left, bottom_right, color, -1)
-    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, img)
-
-
-def draw_info_panel(
-    img: np.ndarray,
-    title: str,
-    lines: List[str],
-    origin: Tuple[int, int],
-    width: int,
-    accent_color: Tuple[int, int, int],
-    alpha: float = 0.62,
-) -> int:
-    x, y = origin
-    line_height = 22
-    title_height = 24
-    height = title_height + line_height * len(lines) + 18
-    h, w = img.shape[:2]
-    x2 = min(w - 8, x + width)
-    y2 = min(h - 8, y + height)
-    draw_translucent_rect(img, (x, y), (x2, y2), (16, 18, 19), alpha)
-    cv2.rectangle(img, (x, y), (x2, y2), accent_color, 1)
-    cv2.line(img, (x, y), (x2, y), accent_color, 3)
-    draw_text_with_shadow(img, title, (x + 12, y + 20), 0.54, accent_color, 1, font=cv2.FONT_HERSHEY_DUPLEX)
-    text_y = y + title_height + 18
-    for line in lines:
-        draw_text_with_shadow(img, line, (x + 12, text_y), 0.52, (232, 238, 238), 1, font=cv2.FONT_HERSHEY_DUPLEX)
-        text_y += line_height
-    return y2
-
-
-def draw_center_zone_guides(img: np.ndarray, center_zone_half_width_px: float) -> None:
-    h, w = img.shape[:2]
-    center_x = w // 2
-    left = int(max(0, center_x - center_zone_half_width_px))
-    right = int(min(w - 1, center_x + center_zone_half_width_px))
-    draw_translucent_rect(img, (left, 0), (right, h), (28, 72, 55), 0.12)
-    cv2.line(img, (left, 0), (left, h), (80, 190, 150), 1, cv2.LINE_AA)
-    cv2.line(img, (right, 0), (right, h), (80, 190, 150), 1, cv2.LINE_AA)
-    cv2.line(img, (center_x, 0), (center_x, h), (200, 220, 220), 1, cv2.LINE_AA)
-
 # -------------------------
 # MQTT movement control
 # -------------------------
-MOVEMENT_LEFT = "LEFT"
-MOVEMENT_RIGHT = "RIGHT"
-MOVEMENT_CENTER = "CENTER"
-MOVEMENT_SEARCH = "SEARCH"
-MOVEMENT_IDLE = "IDLE"
-ASSESSMENT_COMMAND_MAP = {
-    MOVEMENT_LEFT: "MOVED_LEFT",
-    MOVEMENT_RIGHT: "MOVED_RIGHT",
-    MOVEMENT_CENTER: "CENTERED",
-    MOVEMENT_SEARCH: "OUT_OF_FRAME",
-    MOVEMENT_IDLE: "STOPPED",
-}
+MOVEMENT_LEFT = "MOVED_LEFT"
+MOVEMENT_RIGHT = "MOVED_RIGHT"
+MOVEMENT_CENTER = "CENTERED"
+MOVEMENT_SEARCH = "SEARCHING"
+MOVEMENT_IDLE = "STOPPED"
 DEFAULT_MQTT_BROKER = "157.173.101.159"
-DEFAULT_MQTT_WS_URL = "ws://157.173.101.159:9001"
-DEFAULT_MOVEMENT_TOPIC = "vision/Corene/movement"
+DEFAULT_MOVEMENT_TOPIC = "vision/Corene/servo_control"
 DEFAULT_STATUS_TOPIC = "vision/Corene/status"
-DEFAULT_TARGET_NAME = "Corene"
-DEFAULT_CAMERA_WIDTH = 960
-DEFAULT_CAMERA_HEIGHT = 540
-DEFAULT_LANDMARK_ROI_WIDTH = 224
-DEFAULT_CENTER_ZONE_RATIO = 0.22
 
 
 def compute_face_error_x(kps: np.ndarray, frame_width: int) -> float:
     face_center_x = float(np.mean(kps[:, 0]))
     return face_center_x - (float(frame_width) / 2.0)
-
-
-def center_zone_geometry(frame_width: int, deadzone_px: float, center_zone_ratio: float) -> Tuple[float, float]:
-    safe_ratio = float(min(0.75, max(0.08, center_zone_ratio)))
-    center_zone_half_width_px = (float(frame_width) * safe_ratio) / 2.0
-    effective_deadzone_px = max(float(deadzone_px), center_zone_half_width_px)
-    return effective_deadzone_px, center_zone_half_width_px
-
-
-def tracking_zone_from_error(error_x: float, deadzone_px: float) -> str:
-    if abs(float(error_x)) <= float(deadzone_px):
-        return "CENTER"
-    if error_x < 0:
-        return "LEFT"
-    return "RIGHT"
-
-
-def assessment_command_for(movement_command: str) -> str:
-    return ASSESSMENT_COMMAND_MAP.get(movement_command, movement_command)
 
 
 def command_from_error_with_hysteresis(
@@ -620,7 +511,7 @@ def command_from_error_with_hysteresis(
     center_exit_hysteresis_px: float,
     previous_command: str,
 ) -> str:
-    # Wider threshold when leaving CENTER prevents LEFT/RIGHT oscillation around center.
+    # Wider threshold when leaving CENTERED prevents MOVED_LEFT/MOVED_RIGHT oscillation around center.
     if previous_command == MOVEMENT_CENTER:
         if abs(error_x) <= (float(deadzone_px) + float(center_exit_hysteresis_px)):
             return MOVEMENT_CENTER
@@ -633,50 +524,79 @@ def command_from_error_with_hysteresis(
 
 
 def build_dashboard_status(
-    seq: int,
     movement_command: str,
     movement_error_x: float,
-    raw_error_x: float,
     face_lock: Optional[FaceLock],
     faces_count: int,
     locked_face_found: bool,
+    confidence_score: Optional[float],
+    match_distance: Optional[float],
     fps: Optional[float],
     threshold: float,
     provider_name: str,
-    target_name: str,
-    target_similarity: Optional[float],
-    target_distance: Optional[float],
-    center_zone_ratio: float,
-    center_zone_half_width_px: float,
-    effective_deadzone_px: float,
-    tracking_zone: str,
-    camera_width: int,
-    camera_height: int,
-    profile_ms: Dict[str, float],
 ) -> Dict[str, object]:
     return {
-        "seq": int(seq),
         "timestamp": time.time(),
         "movement": movement_command,
         "error_x": round(float(movement_error_x), 2),
-        "raw_error_x": round(float(raw_error_x), 2),
         "locked": face_lock is not None,
-        "target": face_lock.target_name if face_lock else target_name,
+        "target": face_lock.target_name if face_lock else None,
         "locked_face_found": bool(locked_face_found),
+        "confidence_score": round(float(confidence_score), 4) if confidence_score is not None else None,
+        "match_distance": round(float(match_distance), 4) if match_distance is not None else None,
         "faces": int(faces_count),
         "fps": round(float(fps), 2) if fps is not None else None,
         "threshold": round(float(threshold), 3),
         "provider": provider_name,
-        "target_similarity": round(float(target_similarity), 4) if target_similarity is not None else None,
-        "target_distance": round(float(target_distance), 4) if target_distance is not None else None,
-        "confidence": round(float(target_similarity), 4) if target_similarity is not None else None,
-        "center_zone_ratio": round(float(center_zone_ratio), 3),
-        "center_zone_half_width_px": round(float(center_zone_half_width_px), 2),
-        "deadzone_px": round(float(effective_deadzone_px), 2),
-        "tracking_zone": tracking_zone,
-        "resolution": {"width": int(camera_width), "height": int(camera_height)},
-        "profile_ms": {key: round(float(value), 2) for key, value in profile_ms.items()},
     }
+
+
+class OperationalLogger:
+    def __init__(self, csv_path: Path, movement_topic: str):
+        self.csv_path = csv_path
+        self.movement_topic = movement_topic
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.fieldnames = [
+            "timestamp_iso",
+            "timestamp_epoch",
+            "speaker_id",
+            "locked",
+            "locked_face_found",
+            "confidence_score",
+            "match_distance",
+            "faces",
+            "error_x",
+            "movement_command",
+            "fps",
+            "threshold",
+            "provider",
+            "mqtt_topic",
+        ]
+        if not self.csv_path.exists():
+            with self.csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                writer.writeheader()
+
+    def log_status(self, status: Dict[str, object]) -> None:
+        row = {
+            "timestamp_iso": datetime.fromtimestamp(float(status["timestamp"])).isoformat(timespec="milliseconds"),
+            "timestamp_epoch": status["timestamp"],
+            "speaker_id": status.get("target") or "none",
+            "locked": status.get("locked"),
+            "locked_face_found": status.get("locked_face_found"),
+            "confidence_score": status.get("confidence_score"),
+            "match_distance": status.get("match_distance"),
+            "faces": status.get("faces"),
+            "error_x": status.get("error_x"),
+            "movement_command": status.get("movement"),
+            "fps": status.get("fps"),
+            "threshold": status.get("threshold"),
+            "provider": status.get("provider"),
+            "mqtt_topic": self.movement_topic,
+        }
+        with self.csv_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(row)
 
 
 class MqttMovementPublisher:
@@ -731,44 +651,33 @@ class MqttMovementPublisher:
         if rc != 0:
             print(f"[MQTT] Unexpected disconnect (rc={rc}), retrying...")
 
-    def publish(self, command: str, force: bool = False) -> str:
+    def publish(self, command: str, force: bool = False):
         now = time.time()
-        movement_keepalive = (
-            command in (MOVEMENT_LEFT, MOVEMENT_RIGHT, MOVEMENT_SEARCH)
-            and self.last_command == command
-            and (now - self.last_publish_at) >= self.min_publish_interval
-        )
         if (
             not force
-            and not movement_keepalive
             and command == self.last_command
             and (now - self.last_publish_at) < self.min_publish_interval
         ):
-            return "throttled"
+            return
         if not self.connected:
-            return "disconnected"
+            return
 
-        wire_command = assessment_command_for(command)
-        info = self.client.publish(self.topic, payload=wire_command, qos=0, retain=False)
+        info = self.client.publish(self.topic, payload=command, qos=0, retain=False)
         if info.rc == mqtt.MQTT_ERR_SUCCESS:
             self.last_command = command
             self.last_publish_at = now
-            return "published"
-        return f"failed:{info.rc}"
 
-    def publish_status(self, status: Dict[str, object], force: bool = False) -> str:
+    def publish_status(self, status: Dict[str, object], force: bool = False):
         now = time.time()
         if not force and (now - self.last_status_publish_at) < self.status_min_publish_interval:
-            return "throttled"
+            return
         if not self.connected:
-            return "disconnected"
+            return
 
         payload = json.dumps(status, separators=(",", ":"))
         info = self.client.publish(self.status_topic, payload=payload, qos=0, retain=False)
         if info.rc == mqtt.MQTT_ERR_SUCCESS:
             self.last_status_publish_at = now
-            return "published"
-        return f"failed:{info.rc}"
 
     def close(self):
         try:
@@ -776,98 +685,6 @@ class MqttMovementPublisher:
             self.client.disconnect()
         except Exception:
             pass
-
-
-class EvidenceLogger:
-    def __init__(self, log_dir: Path, min_interval_sec: float = 0.25, enabled: bool = True):
-        self.enabled = bool(enabled)
-        self.min_interval_sec = float(max(0.0, min_interval_sec))
-        self.last_write_at = 0.0
-        self.path: Optional[Path] = None
-        self._fh: Optional[TextIO] = None
-
-        if self.enabled:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.path = log_dir / f"face_tracking_evidence_{stamp}.jsonl"
-            self._fh = self.path.open("a", encoding="utf-8")
-            print(f"[Evidence] JSONL log: {self.path}")
-
-    def write(self, record: Dict[str, object], force: bool = False) -> None:
-        if not self.enabled or self._fh is None:
-            return
-
-        now = time.time()
-        if not force and (now - self.last_write_at) < self.min_interval_sec:
-            return
-
-        enriched = {
-            "logged_at": datetime.fromtimestamp(now).isoformat(timespec="milliseconds"),
-            **record,
-        }
-        self._fh.write(json.dumps(enriched, separators=(",", ":")) + "\n")
-        self._fh.flush()
-        self.last_write_at = now
-
-    def close(self) -> None:
-        if self._fh is not None:
-            self._fh.close()
-            self._fh = None
-
-
-class SessionCsvLogger:
-    """BENAX session CSV: speaker ID, confidence, timestamps, motor commands."""
-
-    FIELDNAMES = [
-        "timestamp",
-        "iso_time",
-        "speaker_id",
-        "confidence",
-        "movement_command",
-        "assessment_command",
-        "error_x",
-        "faces_detected",
-        "locked",
-        "locked_face_found",
-    ]
-
-    def __init__(self, log_dir: Path, min_interval_sec: float = 0.25, enabled: bool = True):
-        self.enabled = bool(enabled)
-        self.min_interval_sec = float(max(0.0, min_interval_sec))
-        self.last_write_at = 0.0
-        self.path: Optional[Path] = None
-        self._fh: Optional[TextIO] = None
-        self._writer: Optional[csv.DictWriter] = None
-
-        if not self.enabled:
-            return
-
-        log_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.path = log_dir / f"session_{stamp}.csv"
-        self._fh = self.path.open("a", encoding="utf-8", newline="")
-        self._writer = csv.DictWriter(self._fh, fieldnames=self.FIELDNAMES)
-        self._writer.writeheader()
-        self._fh.flush()
-        print(f"[CSV] Session log: {self.path}")
-
-    def write(self, row: Dict[str, object], force: bool = False) -> None:
-        if not self.enabled or self._writer is None or self._fh is None:
-            return
-
-        now = time.time()
-        if not force and (now - self.last_write_at) < self.min_interval_sec:
-            return
-
-        self._writer.writerow({key: row.get(key, "") for key in self.FIELDNAMES})
-        self._fh.flush()
-        self.last_write_at = now
-
-    def close(self) -> None:
-        if self._fh is not None:
-            self._fh.close()
-            self._fh = None
-            self._writer = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -892,27 +709,37 @@ def parse_args() -> argparse.Namespace:
         help="MQTT client id.",
     )
     parser.add_argument(
-        "--target-name",
-        default=DEFAULT_TARGET_NAME,
-        help="Single authorized speaker identity to recognize, lock, track, and log.",
+        "--speaker-name",
+        default=None,
+        help="Name of the single enrolled speaker to track. If omitted and the DB has one identity, that identity is used.",
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=1,
+        help="OpenCV camera index to use for the tracking camera.",
+    )
+    parser.add_argument(
+        "--manual-lock",
+        action="store_true",
+        help="Require pressing 'l' before tracking instead of automatically locking the enrolled speaker.",
+    )
+    parser.add_argument(
+        "--evidence-log",
+        default="logs/operational_log.csv",
+        help="CSV file for timestamped speaker confidence and motor command evidence.",
     )
     parser.add_argument(
         "--deadzone-px",
         type=float,
-        default=70.0,
-        help="Minimum horizontal pixel deadzone around frame center for CENTER command.",
-    )
-    parser.add_argument(
-        "--center-zone-ratio",
-        type=float,
-        default=DEFAULT_CENTER_ZONE_RATIO,
-        help="Fraction of frame width treated as the acceptable center band.",
+        default=80.0,
+        help="Horizontal pixel deadzone around frame center for CENTERED command.",
     )
     parser.add_argument(
         "--center-exit-hysteresis-px",
         type=float,
-        default=45.0,
-        help="Extra pixels required to leave CENTER and start LEFT/RIGHT movement.",
+        default=30.0,
+        help="Extra pixels required to leave CENTERED and start MOVED_LEFT/MOVED_RIGHT movement.",
     )
     parser.add_argument(
         "--error-smooth-alpha",
@@ -923,49 +750,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--command-confirm-frames",
         type=int,
-        default=1,
-        help="How many consecutive frames are needed before changing LEFT/RIGHT/CENTER.",
+        default=2,
+        help="How many consecutive frames are needed before changing MOVED_LEFT/MOVED_RIGHT/CENTERED.",
     )
     parser.add_argument(
-        "--scan-delay-sec",
-        dest="scan_delay_sec",
+        "--search-delay-sec",
         type=float,
         default=0.0,
-        help="Delay before SEARCH when the locked face is occluded but other faces may still be visible.",
-    )
-    parser.add_argument(
-        "--search-delay-no-faces-sec",
-        type=float,
-        default=0.0,
-        help="Delay before SEARCH when zero faces are detected while locked (0 = immediate sweep).",
-    )
-    parser.add_argument(
-        "--no-auto-lock",
-        action="store_true",
-        help="Require pressing l to lock; default auto-locks onto the enrolled target speaker.",
-    )
-    parser.add_argument(
-        "--reacquire-hold-sec",
-        type=float,
-        default=0.0,
-        help="Short pause after SEARCH finds the locked face again before tracking resumes (0 = immediate).",
-    )
-    parser.add_argument(
-        "--unlock-timeout-sec",
-        type=float,
-        default=40.0,
-        help="Unlock speaker if not seen for this many seconds while locked.",
-    )
-    parser.add_argument(
-        "--search-unlock-sec",
-        type=float,
-        default=0.0,
-        help="Unlock speaker if still lost/searching after this many seconds (0 = disabled).",
+        help="Delay before sending SEARCHING after the locked face is temporarily lost.",
     )
     parser.add_argument(
         "--mqtt-min-interval",
         type=float,
-        default=0.08,
+        default=0.15,
         help="Minimum seconds between repeated identical MQTT commands.",
     )
     parser.add_argument(
@@ -974,59 +771,10 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="Minimum seconds between dashboard status MQTT messages.",
     )
-    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
-    parser.add_argument("--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH, help="Requested camera width.")
-    parser.add_argument("--camera-height", type=int, default=DEFAULT_CAMERA_HEIGHT, help="Requested camera height.")
-    parser.add_argument("--max-faces", type=int, default=5, help="Maximum faces to detect when unlocked.")
-    parser.add_argument("--locked-max-faces", type=int, default=5, help="Maximum faces to detect while locked.")
-    parser.add_argument("--detect-every", type=int, default=2, help="Run Haar/FaceMesh detection every N frames.")
-    parser.add_argument("--recognize-every", type=int, default=3, help="Run ArcFace recognition every N frames per face.")
-    parser.add_argument("--landmark-roi-width", type=int, default=DEFAULT_LANDMARK_ROI_WIDTH, help="Resize large FaceMesh ROIs to this width.")
-    parser.add_argument("--haar-scale", type=float, default=0.5, help="Internal Haar detection scale, 0.2..1.0.")
-    parser.add_argument("--cv-threads", type=int, default=0, help="OpenCV thread count. 0 lets OpenCV decide.")
-    parser.add_argument("--profile", action="store_true", help="Show lightweight CPU timing overlay and console samples.")
-    parser.add_argument(
-        "--command-hold-sec",
-        type=float,
-        default=0.08,
-        help="Minimum seconds to hold visible servo command before accepting a different command.",
-    )
     parser.add_argument(
         "--disable-mqtt",
         action="store_true",
         help="Run face lock tracking without MQTT publishing.",
-    )
-    parser.add_argument(
-        "--evidence-log-dir",
-        default="logs/evidence",
-        help="Directory for structured JSONL evidence logs.",
-    )
-    parser.add_argument(
-        "--evidence-log-interval-sec",
-        type=float,
-        default=0.25,
-        help="Minimum seconds between structured evidence records.",
-    )
-    parser.add_argument(
-        "--disable-evidence-log",
-        action="store_true",
-        help="Disable structured JSONL operational evidence logging.",
-    )
-    parser.add_argument(
-        "--csv-log-dir",
-        default="logs",
-        help="Directory for BENAX session CSV logs (session_YYYYMMDD_HHMMSS.csv).",
-    )
-    parser.add_argument(
-        "--log-interval",
-        type=float,
-        default=0.25,
-        help="Minimum seconds between CSV session log rows.",
-    )
-    parser.add_argument(
-        "--disable-csv-log",
-        action="store_true",
-        help="Disable CSV session logging.",
     )
     return parser.parse_args()
 
@@ -1047,244 +795,28 @@ def save_action_history(face_name: str, actions: List[Action]):
             f.write(f"{time_str} - {action.type.name}: {action.details}\n")
 
 
-def configure_cv_for_cpu(thread_count: int) -> None:
-    cv2.setUseOptimized(True)
-    if thread_count >= 0:
-        try:
-            cv2.setNumThreads(int(thread_count))
-        except Exception:
-            pass
-
-
-def empty_match() -> MatchResult:
-    return MatchResult(name=None, distance=1.0, similarity=0.0, accepted=False)
-
-
-def stable_label_from_history(history: List[str]) -> str:
-    if not history:
-        return "Unknown"
-    majority_label = max(set(history), key=history.count)
-    unknown_ratio = history.count("Unknown") / len(history)
-    if majority_label != "Unknown" and unknown_ratio < 0.5:
-        return majority_label
-    return "Unknown"
-
-
-def recognize_with_cache(
-    frame: np.ndarray,
-    face: FaceDet,
-    cache: CachedFace,
-    face_index: int,
-    frame_index: int,
-    embedder: ArcFaceEmbedderONNX,
-    matcher: FaceDBMatcher,
-    smoothing_window: int,
-    label_smoothing_window: int,
-    recognize_every: int,
-) -> Tuple[MatchResult, str, Optional[np.ndarray], bool]:
-    should_recognize = cache.match is None or ((frame_index + face_index) % recognize_every == 0)
-    if should_recognize:
-        aligned, _ = align_face_5pt(frame, face.kps, out_size=(112, 112))
-        emb_raw = embedder.embed(aligned)
-        cache.embedding_history.append(emb_raw)
-        if len(cache.embedding_history) > smoothing_window:
-            cache.embedding_history.pop(0)
-
-        emb_stack = np.stack(cache.embedding_history, axis=0)
-        emb = emb_stack.mean(axis=0)
-        emb = (emb / (np.linalg.norm(emb) + 1e-12)).astype(np.float32)
-        mr = matcher.match(emb)
-        raw_label = mr.name if mr.name is not None and mr.accepted else "Unknown"
-        cache.label_history.append(raw_label)
-        if len(cache.label_history) > label_smoothing_window:
-            cache.label_history.pop(0)
-
-        cache.emb = emb
-        cache.match = mr
-        cache.stable_label = stable_label_from_history(cache.label_history)
-        cache.aligned = aligned
-        cache.last_recognized_frame = frame_index
-
-    return cache.match or empty_match(), cache.stable_label, cache.aligned, should_recognize
-
-
-def face_center(face: FaceDet) -> Tuple[float, float]:
-    return ((face.x1 + face.x2) * 0.5, (face.y1 + face.y2) * 0.5)
-
-
-def match_caches_to_faces(
-    old_faces: List[FaceDet],
-    new_faces: List[FaceDet],
-    old_cache: Dict[int, CachedFace],
-) -> Dict[int, CachedFace]:
-    matched: Dict[int, CachedFace] = {}
-    used_old: set[int] = set()
-    for new_i, new_face in enumerate(new_faces):
-        nx, ny = face_center(new_face)
-        best_i: Optional[int] = None
-        best_dist = float("inf")
-        for old_i, old_face in enumerate(old_faces):
-            if old_i in used_old or old_i not in old_cache:
-                continue
-            ox, oy = face_center(old_face)
-            dist = float(np.hypot(nx - ox, ny - oy))
-            max_reasonable = max(80.0, 0.75 * max(new_face.x2 - new_face.x1, new_face.y2 - new_face.y1))
-            if dist < best_dist and dist <= max_reasonable:
-                best_dist = dist
-                best_i = old_i
-        if best_i is not None:
-            matched[new_i] = old_cache[best_i]
-            used_old.add(best_i)
-        else:
-            matched[new_i] = CachedFace()
-    return matched
-
-
-def search_delay_for_missing_faces(
-    faces_count: int,
-    search_delay_no_faces_sec: float,
-    scan_delay_sec: float,
-) -> float:
-    if faces_count == 0:
-        return search_delay_no_faces_sec
-    return scan_delay_sec
-
-
-def should_search_for_target(
-    *,
-    face_lock: Optional["FaceLock"],
-    locked_face_found: bool,
-    auto_lock: bool,
-    target_lock_candidate: Optional[Tuple[str, np.ndarray, np.ndarray]],
-    face_missing_since: Optional[float],
-    current_time: float,
-    faces_count: int,
-    search_delay_no_faces_sec: float,
-    scan_delay_sec: float,
-) -> bool:
-    """Keep sweeping until the enrolled target is visible and locked."""
-    if locked_face_found:
-        return False
-    if auto_lock and target_lock_candidate is not None:
-        return False
-    if face_lock is not None:
-        if face_missing_since is None:
-            return False
-        delay_sec = search_delay_for_missing_faces(
-            faces_count,
-            search_delay_no_faces_sec,
-            scan_delay_sec,
-        )
-        return (current_time - face_missing_since) >= delay_sec
-    if auto_lock:
-        return True
-    return False
-
-
-def reset_after_unlock(current_time: float) -> Dict[str, object]:
-    return {
-        "face_lock": None,
-        "selected_face_index": None,
-        "potential_face_to_lock": None,
-        "filtered_error_x": None,
-        "stable_track_command": MOVEMENT_CENTER,
-        "visible_movement_command": MOVEMENT_IDLE,
-        "visible_command_changed_at": current_time,
-        "pending_track_command": None,
-        "pending_track_count": 0,
-        "face_missing_since": None,
-        "reacquire_hold_until": 0.0,
-        "scan_started_logged": False,
-        "searching_for_target": False,
-    }
-
-
-def unlock_speaker(
-    face_lock: FaceLock,
-    current_time: float,
-    reason: str,
-    mqtt_publisher: Optional["MqttMovementPublisher"],
-) -> Dict[str, object]:
-    save_action_history(face_lock.target_name, face_lock.history)
-    face_lock.history.append(Action(ActionType.FACE_UNLOCKED, current_time, reason))
-    print(f"[FaceLock] Unlocked {face_lock.target_name}: {reason}")
-    if mqtt_publisher is not None:
-        mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
-    return reset_after_unlock(current_time)
-
-
-def try_reacquire_locked_face(
-    face_lock: FaceLock,
-    faces: List[FaceDet],
-    face_cache: Dict[int, CachedFace],
-    dist_thresh: float,
-) -> Optional[Tuple[np.ndarray, List[int]]]:
-    """Match locked identity by embedding when label flickers but the face is still in frame."""
-    best_i: Optional[int] = None
-    best_dist = float("inf")
-    for i, face in enumerate(faces):
-        cache = face_cache.get(i)
-        if cache is None or cache.emb is None:
-            continue
-        dist = cosine_distance(cache.emb, face_lock.target_emb)
-        if dist <= dist_thresh and dist < best_dist:
-            best_dist = dist
-            best_i = i
-    if best_i is None:
-        return None
-    face = faces[best_i]
-    return face.kps.copy(), [int(face.x1), int(face.y1), int(face.x2), int(face.y2)]
-
-
-def apply_command_hold(
-    desired_command: str,
-    current_command: str,
-    changed_at: float,
-    hold_sec: float,
-    now: float,
-) -> Tuple[str, float]:
-    if desired_command == current_command:
-        return current_command, changed_at
-    if current_command not in (MOVEMENT_IDLE, MOVEMENT_SEARCH) and (now - changed_at) < hold_sec:
-        return current_command, changed_at
-    return desired_command, now
-
+def create_face_lock(name: str, emb: np.ndarray, kps: np.ndarray, current_time: float) -> FaceLock:
+    face_lock = FaceLock(
+        target_name=name,
+        target_emb=emb,
+        last_seen=current_time,
+    )
+    face_lock.update_position(kps)
+    face_lock.history.append(Action(
+        ActionType.FACE_LOCKED,
+        current_time,
+        f"Face locked: {name}",
+    ))
+    return face_lock
 
 def main():
     args = parse_args()
     args.error_smooth_alpha = float(max(0.01, min(1.0, args.error_smooth_alpha)))
     args.command_confirm_frames = int(max(1, args.command_confirm_frames))
-    args.scan_delay_sec = float(max(0.0, args.scan_delay_sec))
-    args.search_delay_no_faces_sec = float(max(0.0, args.search_delay_no_faces_sec))
-    args.auto_lock = not bool(args.no_auto_lock)
-    args.reacquire_hold_sec = float(max(0.0, args.reacquire_hold_sec))
-    args.unlock_timeout_sec = float(max(0.0, args.unlock_timeout_sec))
-    args.search_unlock_sec = float(max(0.0, args.search_unlock_sec))
-    args.evidence_log_interval_sec = float(max(0.0, args.evidence_log_interval_sec))
-    args.log_interval = float(max(0.0, args.log_interval))
+    args.search_delay_sec = float(max(0.0, args.search_delay_sec))
     args.mqtt_min_interval = float(max(0.0, args.mqtt_min_interval))
     args.mqtt_status_min_interval = float(max(0.0, args.mqtt_status_min_interval))
-    args.deadzone_px = float(max(0.0, args.deadzone_px))
-    args.center_zone_ratio = float(min(0.75, max(0.08, args.center_zone_ratio)))
     args.center_exit_hysteresis_px = float(max(0.0, args.center_exit_hysteresis_px))
-    args.target_name = str(args.target_name).strip()
-    if not args.target_name:
-        raise ValueError("--target-name cannot be empty for single-speaker lock mode.")
-    args.max_faces = int(max(1, args.max_faces))
-    args.locked_max_faces = int(max(1, min(args.max_faces, args.locked_max_faces)))
-    args.detect_every = int(max(1, args.detect_every))
-    args.recognize_every = int(max(1, args.recognize_every))
-    args.command_hold_sec = float(max(0.0, args.command_hold_sec))
-    args.haar_scale = float(min(1.0, max(0.2, args.haar_scale)))
-    args.landmark_roi_width = int(max(80, args.landmark_roi_width))
-    if args.camera_width <= 0 or args.camera_height <= 0:
-        raise ValueError("--camera-width and --camera-height must be positive integers.")
-    requested_aspect = args.camera_width / float(args.camera_height)
-    if abs(requested_aspect - (16.0 / 9.0)) > 0.02:
-        corrected_height = int(round(args.camera_width * 9.0 / 16.0))
-        print(f"[camera] Adjusting height to keep 16:9: {args.camera_width}x{corrected_height}")
-        args.camera_height = max(1, corrected_height)
-    configure_cv_for_cpu(args.cv_threads)
     db_path = Path("data/db/face_db.npz")
     os.makedirs("logs", exist_ok=True)
     
@@ -1302,8 +834,6 @@ def main():
     
     det = HaarFaceMesh5pt(
         min_size=(70, 70),
-        haar_scale=args.haar_scale,
-        landmark_roi_width=args.landmark_roi_width,
         debug=False,
     )
     embedder = ArcFaceEmbedderONNX(
@@ -1312,33 +842,43 @@ def main():
         debug=False,
         providers=providers,
     )
-    all_db = load_db_npz(db_path)
-    if not all_db:
+    db = load_db_npz(db_path)
+    if not db:
         print("Warning: Database is empty. Please enroll identities first.")
         det.close()
         return
-    if args.target_name not in all_db:
-        print(f"Error: target speaker '{args.target_name}' is not in {db_path}.")
-        print(f"Available identities: {', '.join(sorted(all_db.keys()))}")
-        det.close()
-        return
-    db = {args.target_name: all_db[args.target_name]}
+
+    target_speaker: Optional[str] = args.speaker_name.strip() if args.speaker_name else None
+    if target_speaker:
+        if target_speaker not in db:
+            print(f"Warning: speaker '{target_speaker}' is not in the face database.")
+            print(f"Available identities: {', '.join(sorted(db.keys()))}")
+            det.close()
+            return
+        db = {target_speaker: db[target_speaker]}
+    elif len(db) == 1:
+        target_speaker = next(iter(db.keys()))
+    else:
+        print("Warning: Multiple identities are enrolled. Use --speaker-name for strict single-speaker lock.")
     
     # Default threshold 0.40 for better recall (can be adjusted with +/-)
     matcher = FaceDBMatcher(db=db, dist_thresh=0.40)
     
-    cap = cv2.VideoCapture(args.camera_index)
+    print(f"Opening camera index: {args.camera_index}")
+    cap = cv2.VideoCapture(args.camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
         print("Camera not available")
         det.close()
         return
     
-    camera_width = args.camera_width
-    camera_height = args.camera_height
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # Set camera resolution (higher = better face detection, GPU can handle it)
+    # Common resolutions: 640x480, 1280x720, 1920x1080
+    # With GPU acceleration, higher resolution improves detection quality
+    # You can adjust these values based on your camera capabilities
+    camera_width = 1280  # Try 1920 for Full HD if your camera supports it
+    camera_height = 720  # Try 1080 for Full HD if your camera supports it
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_height)
-    cap.set(cv2.CAP_PROP_FPS, 30)
     
     # Verify actual resolution (camera may not support requested resolution)
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1346,24 +886,10 @@ def main():
     print(f"Camera resolution: {actual_width}x{actual_height}")
     if actual_width != camera_width or actual_height != camera_height:
         print(f"  (Requested {camera_width}x{camera_height}, camera using {actual_width}x{actual_height})")
-
-    window_name = "Face Recognition - Press 'q' to quit"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, int(camera_width), int(camera_height))
     
-    print(f"\nRecognize target speaker: {args.target_name} - Using {provider_name}")
-    if args.auto_lock:
-        print("Auto-lock: ON (SEARCH sweeps until Corene is found; tracking stops the sweep)")
-    else:
-        print("Auto-lock: OFF (press l to lock)")
+    print(f"\nRecognize (multi-face) - Using {provider_name}")
     print("Controls: q=quit, r=reload DB, +/- threshold, d=debug overlay")
-    print("          LEFT/RIGHT arrows (or a/f keys) to select face")
-    print("          l or u = lock / unlock speaker")
-    print("          1=LEFT 2=RIGHT 3=CENTER 4=SCAN 5=STOP (direct MQTT servo test)")
-    if args.unlock_timeout_sec > 0:
-        print(f"Auto-unlock: after {args.unlock_timeout_sec:.0f}s if speaker not seen")
-    if args.search_unlock_sec > 0:
-        print(f"Search-unlock: after {args.search_unlock_sec:.0f}s lost without reacquire")
+    print("          LEFT/RIGHT arrows (or a/f keys) to select face, l=lock/unlock selected face")
     print(
         f"MQTT movement topic: {args.mqtt_topic} @ {args.mqtt_broker}:{args.mqtt_port}"
         if not args.disable_mqtt
@@ -1371,46 +897,23 @@ def main():
     )
     if not args.disable_mqtt:
         print(f"MQTT dashboard status topic: {args.mqtt_status_topic}")
-        print(f"MQTT WebSocket (dashboard): {DEFAULT_MQTT_WS_URL}")
-        print("MQTT movement payloads (BENAX): MOVED_LEFT, MOVED_RIGHT, CENTERED, OUT_OF_FRAME, STOPPED")
+    if target_speaker:
+        mode = "manual" if args.manual_lock else "automatic"
+        print(f"Authorized speaker: {target_speaker} ({mode} lock)")
+    print(f"Evidence log: {args.evidence_log}")
     t0 = time.time()
     frames = 0
     fps: Optional[float] = None
     show_debug = False
     movement_command = MOVEMENT_IDLE
     movement_error_x = 0.0
-    raw_movement_error_x = 0.0
-    tracking_zone = "CENTER"
-    effective_deadzone_px = args.deadzone_px
-    center_zone_half_width_px = args.deadzone_px
     filtered_error_x: Optional[float] = None
     stable_track_command = MOVEMENT_CENTER
-    visible_movement_command = MOVEMENT_IDLE
-    visible_command_changed_at = time.time()
     pending_track_command: Optional[str] = None
     pending_track_count = 0
     face_missing_since: Optional[float] = None
-    reacquire_hold_until = 0.0
-    scan_started_logged = False
-    searching_for_target = False
     mqtt_publisher: Optional[MqttMovementPublisher] = None
-    status_seq = 0
-    frame_index = 0
-    last_detect_frame = -9999
-    faces: List[FaceDet] = []
-    face_cache: Dict[int, CachedFace] = {}
-    profile_last_print_at = 0.0
-    last_profile: Dict[str, float] = {"detect": 0.0, "recognize": 0.0, "draw": 0.0}
-    evidence_logger = EvidenceLogger(
-        log_dir=Path(args.evidence_log_dir),
-        min_interval_sec=args.evidence_log_interval_sec,
-        enabled=not args.disable_evidence_log,
-    )
-    session_csv_logger = SessionCsvLogger(
-        log_dir=Path(args.csv_log_dir),
-        min_interval_sec=args.log_interval,
-        enabled=not args.disable_csv_log,
-    )
+    operational_logger = OperationalLogger(Path(args.evidence_log), args.mqtt_topic)
 
     if args.disable_mqtt:
         print("[MQTT] Disabled by flag (--disable-mqtt)")
@@ -1428,54 +931,35 @@ def main():
                 status_min_publish_interval=args.mqtt_status_min_interval,
             )
             mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
-            connect_deadline = time.time() + 15.0
-            while not mqtt_publisher.connected and time.time() < connect_deadline:
-                time.sleep(0.15)
-            if mqtt_publisher.connected:
-                print("[MQTT] Broker connected — motor commands enabled")
-            else:
-                print(
-                    f"[MQTT] WARNING: Not connected to {args.mqtt_broker}:{args.mqtt_port}. "
-                    "Servo will not move until the broker is reachable."
-                )
         except Exception as e:
             print(f"[MQTT] Failed to initialize publisher: {e}")
             mqtt_publisher = None
     
-    last_logged_mqtt_command: Optional[str] = None
-    last_mqtt_warn_at = 0.0
-
     # Face locking state
     face_lock: Optional[FaceLock] = None
+    max_timeout = 40.0  # seconds before unlocking if face is lost
     
     # Face selection for locking (when multiple faces present)
     selected_face_index: Optional[int] = None  # Index of currently selected face (None = auto-select first)
     potential_face_to_lock: Optional[Tuple[str, np.ndarray, np.ndarray]] = None  # (name, emb, kps) of selected face
     
+    # Temporal smoothing for better accuracy (average recent embeddings per face)
+    # Maps face_id -> list of recent embeddings (max smoothing_window)
+    face_embedding_history: Dict[int, List[np.ndarray]] = {}
     smoothing_window = 5  # Number of frames to average
 
+    # Additional label smoothing to reduce flicker in displayed names.
+    # Maps face_id -> recent predicted labels (e.g., ["Alice", "Alice", "Unknown", ...])
+    face_label_history: Dict[int, List[str]] = {}
     label_smoothing_window = 7  # More frames here = more stable, slightly slower to react
     
     try:
         while True:
-            frame_started_at = time.perf_counter()
             ok, frame = cap.read()
             if not ok:
                 break
-
-            frame_index += 1
-            current_time = time.time()
-            last_profile["recognize"] = 0.0
-            detect_started_at = time.perf_counter()
-            detect_due = (frame_index - last_detect_frame) >= args.detect_every
-            if detect_due:
-                detect_max_faces = args.locked_max_faces if face_lock else args.max_faces
-                previous_faces = faces
-                faces = det.detect(frame, max_faces=detect_max_faces)
-                face_cache = match_caches_to_faces(previous_faces, faces, face_cache)
-                last_detect_frame = frame_index
-            last_profile["detect"] = (time.perf_counter() - detect_started_at) * 1000.0
-
+            
+            faces = det.detect(frame, max_faces=5)
             vis = frame.copy()
             
             # compute fps
@@ -1488,19 +972,32 @@ def main():
             
             # draw + recognize each face
             h, w = vis.shape[:2]
-            effective_deadzone_px, center_zone_half_width_px = center_zone_geometry(
-                frame_width=w,
-                deadzone_px=args.deadzone_px,
-                center_zone_ratio=args.center_zone_ratio,
-            )
             thumb = 112
             pad = 8
             x0 = w - thumb - pad
             y0 = 80
             shown = 0
             
+            # Check if we should unlock due to timeout
+            current_time = time.time()
+            if face_lock and (current_time - face_lock.last_seen) > max_timeout:
+                save_action_history(face_lock.target_name, face_lock.history)
+                print(f"[FaceLock] Timeout - Unlocked {face_lock.target_name}")
+                face_lock = None
+                selected_face_index = None
+                potential_face_to_lock = None
+                filtered_error_x = None
+                stable_track_command = MOVEMENT_CENTER
+                pending_track_command = None
+                pending_track_count = 0
+                face_missing_since = None
+                if mqtt_publisher is not None:
+                    mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
             
-            face_cache = {k: v for k, v in face_cache.items() if k < len(faces)}
+            # Clean up embedding / label history for faces that disappeared
+            active_face_ids = set(range(len(faces)))
+            face_embedding_history = {k: v for k, v in face_embedding_history.items() if k in active_face_ids}
+            face_label_history = {k: v for k, v in face_label_history.items() if k in active_face_ids}
             
             # Reset selection if selected face disappeared
             if selected_face_index is not None and selected_face_index >= len(faces):
@@ -1509,91 +1006,112 @@ def main():
 
             locked_face_found = False
             locked_face_kps: Optional[np.ndarray] = None
-            locked_face_bbox: Optional[List[int]] = None
-            target_match: Optional[MatchResult] = None
-            target_lock_candidate: Optional[Tuple[str, np.ndarray, np.ndarray]] = None
-            frame_match_records: List[Dict[str, object]] = []
+            locked_confidence_score: Optional[float] = None
+            locked_match_distance: Optional[float] = None
             
             for i, f in enumerate(faces):
                 cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
                 for (x, y) in f.kps.astype(int):
                     cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
                 
-                cache = face_cache.setdefault(i, CachedFace())
-                recognize_started_at = time.perf_counter()
-                mr, stable_label, aligned, recognized_now = recognize_with_cache(
-                    frame=frame,
-                    face=f,
-                    cache=cache,
-                    face_index=i,
-                    frame_index=frame_index,
-                    embedder=embedder,
-                    matcher=matcher,
-                    smoothing_window=smoothing_window,
-                    label_smoothing_window=label_smoothing_window,
-                    recognize_every=args.recognize_every,
-                )
-                if recognized_now:
-                    last_profile["recognize"] += (time.perf_counter() - recognize_started_at) * 1000.0
-
-                if mr.name == args.target_name and mr.accepted:
-                    if target_match is None or mr.similarity > target_match.similarity:
-                        target_match = mr
-                    target_lock_candidate = (
-                        args.target_name,
-                        cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32),
-                        f.kps.copy(),
-                    )
+                # align -> embed -> temporal smoothing -> match
+                aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
+                emb_raw = embedder.embed(aligned)
                 
-                # Check if this is our locked face (name match or embedding match)
+                # Temporal smoothing: average recent embeddings for this face
+                if i not in face_embedding_history:
+                    face_embedding_history[i] = []
+                face_embedding_history[i].append(emb_raw)
+                if len(face_embedding_history[i]) > smoothing_window:
+                    face_embedding_history[i].pop(0)
+                
+                # Average embeddings and L2-normalize
+                if len(face_embedding_history[i]) > 0:
+                    emb_stack = np.stack(face_embedding_history[i], axis=0)
+                    emb_smooth = emb_stack.mean(axis=0)
+                    emb_smooth = emb_smooth / (np.linalg.norm(emb_smooth) + 1e-12)
+                    emb = emb_smooth.astype(np.float32)
+                else:
+                    emb = emb_raw
+                
+                mr = matcher.match(emb)
+
+                # -----------------------------
+                # Label smoothing (majority vote)
+                # -----------------------------
+                raw_label = mr.name if mr.name is not None and mr.accepted else "Unknown"
+                if i not in face_label_history:
+                    face_label_history[i] = []
+                face_label_history[i].append(raw_label)
+                if len(face_label_history[i]) > label_smoothing_window:
+                    face_label_history[i].pop(0)
+
+                hist = face_label_history[i]
+                if hist:
+                    # Majority label in recent history
+                    uniq = set(hist)
+                    majority_label = max(uniq, key=hist.count)
+                    unknown_count = hist.count("Unknown")
+                    unknown_ratio = unknown_count / len(hist)
+
+                    # Only show a name if it dominates recent history and
+                    # there aren't too many 'Unknown' frames.
+                    if majority_label != "Unknown" and unknown_ratio < 0.5:
+                        stable_label = majority_label
+                    else:
+                        stable_label = "Unknown"
+                else:
+                    stable_label = raw_label
+                
+                # Check if this is our locked face
                 is_locked_face = False
-                lock_emb_match = False
-                if face_lock and cache.emb is not None:
-                    lock_emb_match = cosine_distance(cache.emb, face_lock.target_emb) <= matcher.dist_thresh
-                if face_lock and (
-                    (mr.name == face_lock.target_name and mr.accepted) or lock_emb_match
-                ):
-                    face_lock.update_position(f.kps)
+                if face_lock and mr.name == face_lock.target_name and mr.accepted:
+                    # Update face lock with new position and detect actions
+                    actions = face_lock.update_position(f.kps)
+                    face_lock.history.extend(actions)
+                    for action in actions:
+                        print(f"[Action] {action.type.name}: {action.details}")
                     is_locked_face = True
                     locked_face_found = True
                     locked_face_kps = f.kps.copy()
-                    locked_face_bbox = [int(f.x1), int(f.y1), int(f.x2), int(f.y2)]
-
-                frame_match_records.append(
-                    {
-                        "index": int(i),
-                        "bbox": [int(f.x1), int(f.y1), int(f.x2), int(f.y2)],
-                        "accepted": bool(mr.accepted),
-                        "name": mr.name,
-                        "stable_label": stable_label,
-                        "similarity": round(float(mr.similarity), 4),
-                        "distance": round(float(mr.distance), 4),
-                        "is_target": bool(mr.name == args.target_name and mr.accepted),
-                        "is_locked_face": bool(is_locked_face),
-                    }
-                )
+                    locked_confidence_score = mr.similarity
+                    locked_match_distance = mr.distance
                 
                 # label (use smoothed/stable label for display to reduce flicker)
                 label = stable_label
                 status = " (LOCKED)" if is_locked_face else ""
                 line1 = f"{label}{status}"
-                line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
+                confidence_pct = max(0.0, min(100.0, mr.similarity * 100.0))
+                line2 = f"conf={confidence_pct:.1f}% dist={mr.distance:.3f}"
                 
                 # Determine if this face is selected for locking
                 is_selected = (selected_face_index == i) if selected_face_index is not None else False
                 
                 # Auto-select first recognized face if no manual selection
-                if selected_face_index is None and not face_lock and mr.name and mr.accepted:
+                is_authorized_candidate = mr.name and mr.accepted and (target_speaker is None or mr.name == target_speaker)
+                if selected_face_index is None and not face_lock and is_authorized_candidate:
                     selected_face_index = i
                     is_selected = True
-                    potential_face_to_lock = (mr.name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
+                    potential_face_to_lock = (mr.name, emb, f.kps)
                 
                 # Update potential lock target if this is the selected face
                 if is_selected and not face_lock:
-                    if mr.name and mr.accepted:
-                        potential_face_to_lock = (mr.name, cache.emb if cache.emb is not None else np.zeros(1, dtype=np.float32), f.kps)
+                    if is_authorized_candidate:
+                        potential_face_to_lock = (mr.name, emb, f.kps)
                     else:
                         potential_face_to_lock = None
+
+                if (
+                    not args.manual_lock
+                    and not face_lock
+                    and target_speaker is not None
+                    and mr.name == target_speaker
+                    and mr.accepted
+                ):
+                    face_lock = create_face_lock(target_speaker, emb, f.kps, current_time)
+                    selected_face_index = i
+                    potential_face_to_lock = None
+                    print(f"[FaceLock] Auto-locked onto {target_speaker} (face {i + 1})")
                 
                 # color and border: locked > selected > known > unknown
                 if is_locked_face:
@@ -1622,7 +1140,7 @@ def main():
                     draw_text_with_shadow(vis, hint_text, (f.x1, f.y2 + 45), 0.65, (255, 255, 0), 1, font=cv2.FONT_HERSHEY_DUPLEX)
                 
                 # aligned preview thumbnails (stack)
-                if show_debug and aligned is not None and y0 + thumb <= h and shown < 4:
+                if y0 + thumb <= h and shown < 4:
                     vis[y0:y0 + thumb, x0:x0 + thumb] = aligned
                     draw_text_with_shadow(
                         vis,
@@ -1640,138 +1158,11 @@ def main():
                     dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
                     draw_text_with_shadow(vis, dbg, (10, h - 20), 0.65, (255, 255, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
 
-            if face_lock and not locked_face_found and faces:
-                reacquired = try_reacquire_locked_face(
-                    face_lock=face_lock,
-                    faces=faces,
-                    face_cache=face_cache,
-                    dist_thresh=matcher.dist_thresh,
-                )
-                if reacquired is not None:
-                    locked_face_kps, locked_face_bbox = reacquired
-                    locked_face_found = True
-
-            if not face_lock and args.auto_lock and target_lock_candidate is not None:
-                name, emb, kps = target_lock_candidate
-                face_lock = FaceLock(
-                    target_name=name,
-                    target_emb=emb,
-                    last_seen=current_time,
-                )
-                face_lock.update_position(kps)
-                face_lock.history.append(
-                    Action(ActionType.FACE_LOCKED, current_time, f"Auto-locked: {name}")
-                )
-                locked_face_found = True
-                locked_face_kps = kps.copy()
-                face_missing_since = None
-                reacquire_hold_until = 0.0
-                scan_started_logged = False
-                searching_for_target = False
-                filtered_error_x = None
-                stable_track_command = MOVEMENT_CENTER
-                visible_movement_command = MOVEMENT_CENTER
-                visible_command_changed_at = current_time
-                print(f"[FaceLock] Auto-locked onto {name} — stopping SEARCH")
-                if mqtt_publisher is not None and mqtt_publisher.last_command == MOVEMENT_SEARCH:
-                    mqtt_publisher.publish(MOVEMENT_CENTER, force=True)
-
-            if face_lock and not locked_face_found and face_missing_since is None:
-                if len(faces) == 0:
-                    detail = "No faces detected in frame"
-                else:
-                    detail = "Enrolled speaker not visible among detected faces"
-                lost_action = Action(ActionType.FACE_LOST, current_time, detail)
-                face_lock.history.append(lost_action)
-                face_missing_since = current_time
-                print(f"[Action] {lost_action.type.name}: {lost_action.details}")
-
-            if (
-                face_lock
-                and args.unlock_timeout_sec > 0
-                and (current_time - face_lock.last_seen) > args.unlock_timeout_sec
-            ):
-                unlock_state = unlock_speaker(
-                    face_lock,
-                    current_time,
-                    f"Speaker not seen for {args.unlock_timeout_sec:.0f}s",
-                    mqtt_publisher,
-                )
-                face_lock = unlock_state["face_lock"]
-                selected_face_index = unlock_state["selected_face_index"]
-                potential_face_to_lock = unlock_state["potential_face_to_lock"]
-                filtered_error_x = unlock_state["filtered_error_x"]
-                stable_track_command = unlock_state["stable_track_command"]
-                visible_movement_command = unlock_state["visible_movement_command"]
-                visible_command_changed_at = unlock_state["visible_command_changed_at"]
-                pending_track_command = unlock_state["pending_track_command"]
-                pending_track_count = unlock_state["pending_track_count"]
-                face_missing_since = unlock_state["face_missing_since"]
-                reacquire_hold_until = unlock_state["reacquire_hold_until"]
-                scan_started_logged = unlock_state["scan_started_logged"]
-                searching_for_target = unlock_state["searching_for_target"]
-            elif (
-                face_lock
-                and not locked_face_found
-                and face_missing_since is not None
-                and args.search_unlock_sec > 0
-                and (current_time - face_missing_since) >= args.search_unlock_sec
-            ):
-                unlock_state = unlock_speaker(
-                    face_lock,
-                    current_time,
-                    f"Speaker not reacquired after {args.search_unlock_sec:.0f}s search",
-                    mqtt_publisher,
-                )
-                face_lock = unlock_state["face_lock"]
-                selected_face_index = unlock_state["selected_face_index"]
-                potential_face_to_lock = unlock_state["potential_face_to_lock"]
-                filtered_error_x = unlock_state["filtered_error_x"]
-                stable_track_command = unlock_state["stable_track_command"]
-                visible_movement_command = unlock_state["visible_movement_command"]
-                visible_command_changed_at = unlock_state["visible_command_changed_at"]
-                pending_track_command = unlock_state["pending_track_command"]
-                pending_track_count = unlock_state["pending_track_count"]
-                face_missing_since = unlock_state["face_missing_since"]
-                reacquire_hold_until = unlock_state["reacquire_hold_until"]
-                scan_started_logged = unlock_state["scan_started_logged"]
-                searching_for_target = unlock_state["searching_for_target"]
-
-            # Movement command for ESP servo
+            # Movement command for ESP servo.
+            # Track left/right while the locked speaker is visible; sweep/search when missing.
             if face_lock and locked_face_found and locked_face_kps is not None:
-                was_missing = face_missing_since is not None
-                search_delay_sec = (
-                    args.search_delay_no_faces_sec
-                    if len(faces) == 0
-                    else args.scan_delay_sec
-                )
-                was_scanning = (
-                    was_missing
-                    and (current_time - face_missing_since) >= search_delay_sec
-                )
-                if was_missing:
-                    detail = "Target face reacquired"
-                    if was_scanning:
-                        detail += " after SEARCH"
-                    reacquired_action = Action(ActionType.FACE_REACQUIRED, current_time, detail)
-                    face_lock.history.append(reacquired_action)
-                    print(f"[Action] {reacquired_action.type.name}: {reacquired_action.details}")
                 face_missing_since = None
-                scan_started_logged = False
-                searching_for_target = False
-                if visible_movement_command == MOVEMENT_SEARCH:
-                    visible_movement_command = MOVEMENT_CENTER
-                    visible_command_changed_at = current_time
                 raw_error_x = compute_face_error_x(locked_face_kps, frame_width=w)
-                raw_movement_error_x = float(raw_error_x)
-
-                if was_scanning:
-                    filtered_error_x = raw_error_x
-                    stable_track_command = MOVEMENT_CENTER
-                    pending_track_command = None
-                    pending_track_count = 0
-                    reacquire_hold_until = current_time + args.reacquire_hold_sec
-
                 if filtered_error_x is None:
                     filtered_error_x = raw_error_x
                 else:
@@ -1780,285 +1171,130 @@ def main():
                         + (1.0 - args.error_smooth_alpha) * filtered_error_x
                     )
                 movement_error_x = float(filtered_error_x)
-                tracking_zone = tracking_zone_from_error(movement_error_x, effective_deadzone_px)
 
-                if current_time < reacquire_hold_until:
-                    movement_command = MOVEMENT_IDLE
-                else:
-                    reacquire_hold_until = 0.0
-                    desired_track_command = command_from_error_with_hysteresis(
-                        error_x=movement_error_x,
-                        deadzone_px=effective_deadzone_px,
-                        center_exit_hysteresis_px=args.center_exit_hysteresis_px,
-                        previous_command=stable_track_command,
-                    )
-
-                    if desired_track_command == stable_track_command:
-                        pending_track_command = None
-                        pending_track_count = 0
-                    else:
-                        if pending_track_command == desired_track_command:
-                            pending_track_count += 1
-                        else:
-                            pending_track_command = desired_track_command
-                            pending_track_count = 1
-                        if pending_track_count >= args.command_confirm_frames:
-                            stable_track_command = desired_track_command
-                            pending_track_command = None
-                            pending_track_count = 0
-
-                    movement_command = stable_track_command
-            else:
-                searching_for_target = should_search_for_target(
-                    face_lock=face_lock,
-                    locked_face_found=locked_face_found,
-                    auto_lock=args.auto_lock,
-                    target_lock_candidate=target_lock_candidate,
-                    face_missing_since=face_missing_since,
-                    current_time=current_time,
-                    faces_count=len(faces),
-                    search_delay_no_faces_sec=args.search_delay_no_faces_sec,
-                    scan_delay_sec=args.scan_delay_sec,
+                desired_track_command = command_from_error_with_hysteresis(
+                    error_x=movement_error_x,
+                    deadzone_px=args.deadzone_px,
+                    center_exit_hysteresis_px=args.center_exit_hysteresis_px,
+                    previous_command=stable_track_command,
                 )
 
-                if searching_for_target:
-                    movement_command = MOVEMENT_SEARCH
-                    movement_error_x = 0.0
-                    raw_movement_error_x = 0.0
-                    tracking_zone = "SEARCHING"
-                    pending_track_command = None
-                    pending_track_count = 0
-                    if visible_movement_command != MOVEMENT_SEARCH:
-                        visible_movement_command = MOVEMENT_SEARCH
-                        visible_command_changed_at = current_time
-                    if not scan_started_logged:
-                        detail = (
-                            "Sweeping until enrolled speaker is found"
-                            if not face_lock
-                            else "Started SEARCH to reacquire target"
-                        )
-                        scan_action = Action(ActionType.SCAN_STARTED, current_time, detail)
-                        if face_lock:
-                            face_lock.history.append(scan_action)
-                        scan_started_logged = True
-                        print(f"[Action] {scan_action.type.name}: {scan_action.details}")
-                elif face_lock:
-                    movement_command = MOVEMENT_IDLE
-                    movement_error_x = 0.0
-                    raw_movement_error_x = 0.0
-                    tracking_zone = "MISSING"
+                if desired_track_command == stable_track_command:
                     pending_track_command = None
                     pending_track_count = 0
                 else:
-                    filtered_error_x = None
-                    stable_track_command = MOVEMENT_CENTER
-                    pending_track_command = None
-                    pending_track_count = 0
-                    face_missing_since = None
-                    reacquire_hold_until = 0.0
-                    scan_started_logged = False
+                    if pending_track_command == desired_track_command:
+                        pending_track_count += 1
+                    else:
+                        pending_track_command = desired_track_command
+                        pending_track_count = 1
+                    if pending_track_count >= args.command_confirm_frames:
+                        stable_track_command = desired_track_command
+                        pending_track_command = None
+                        pending_track_count = 0
+
+                movement_command = stable_track_command
+            elif face_lock:
+                if face_missing_since is None:
+                    face_missing_since = current_time
+                    face_lock.history.append(Action(
+                        ActionType.FACE_LOST,
+                        current_time,
+                        "Speaker temporarily out of frame or occluded",
+                    ))
+                lost_for = current_time - face_missing_since
+                if lost_for < args.search_delay_sec:
                     movement_command = MOVEMENT_IDLE
-                    movement_error_x = 0.0
-                    raw_movement_error_x = 0.0
-                    tracking_zone = "IDLE"
+                else:
+                    movement_command = MOVEMENT_SEARCH
+                movement_error_x = 0.0
+            else:
+                filtered_error_x = None
+                stable_track_command = MOVEMENT_CENTER
+                pending_track_command = None
+                pending_track_count = 0
+                face_missing_since = None
+                movement_command = MOVEMENT_IDLE
+                movement_error_x = 0.0
 
-            visible_movement_command, visible_command_changed_at = apply_command_hold(
-                desired_command=movement_command,
-                current_command=visible_movement_command,
-                changed_at=visible_command_changed_at,
-                hold_sec=args.command_hold_sec,
-                now=current_time,
-            )
-            movement_command = visible_movement_command
-
-            status_seq += 1
             status_payload = build_dashboard_status(
-                seq=status_seq,
                 movement_command=movement_command,
                 movement_error_x=movement_error_x,
-                raw_error_x=raw_movement_error_x,
                 face_lock=face_lock,
                 faces_count=len(faces),
                 locked_face_found=locked_face_found,
+                confidence_score=locked_confidence_score,
+                match_distance=locked_match_distance,
                 fps=fps,
                 threshold=matcher.dist_thresh,
                 provider_name=provider_name,
-                target_name=args.target_name,
-                target_similarity=target_match.similarity if target_match is not None else None,
-                target_distance=target_match.distance if target_match is not None else None,
-                center_zone_ratio=args.center_zone_ratio,
-                center_zone_half_width_px=center_zone_half_width_px,
-                effective_deadzone_px=effective_deadzone_px,
-                tracking_zone=tracking_zone,
-                camera_width=w,
-                camera_height=h,
-                profile_ms=last_profile,
             )
-            status_payload["mqtt_connected"] = bool(mqtt_publisher is not None and mqtt_publisher.connected)
-            status_payload["movement_internal"] = movement_command
-            status_payload["movement"] = assessment_command_for(movement_command)
-            status_payload["assessment_command"] = status_payload["movement"]
+            operational_logger.log_status(status_payload)
 
-            mqtt_movement_result = "disabled"
-            mqtt_status_result = "disabled"
             if mqtt_publisher is not None:
-                force_movement_publish = movement_command != mqtt_publisher.last_command
-                mqtt_movement_result = mqtt_publisher.publish(
-                    movement_command,
-                    force=force_movement_publish,
-                )
-                mqtt_status_result = mqtt_publisher.publish_status(status_payload)
-                wire_cmd = assessment_command_for(movement_command)
-                if mqtt_movement_result == "published" and wire_cmd != last_logged_mqtt_command:
-                    print(f"[MQTT] >> {wire_cmd}")
-                    last_logged_mqtt_command = wire_cmd
-                elif mqtt_movement_result == "disconnected" and (current_time - last_mqtt_warn_at) >= 5.0:
-                    print(f"[MQTT] disconnected — cannot reach {args.mqtt_broker}:{args.mqtt_port}")
-                    last_mqtt_warn_at = current_time
-
-            session_csv_logger.write(
-                {
-                    "timestamp": round(current_time, 3),
-                    "iso_time": datetime.fromtimestamp(current_time).isoformat(timespec="milliseconds"),
-                    "speaker_id": face_lock.target_name if face_lock else args.target_name,
-                    "confidence": (
-                        round(float(target_match.similarity), 4)
-                        if target_match is not None
-                        else ""
-                    ),
-                    "movement_command": movement_command,
-                    "assessment_command": assessment_command_for(movement_command),
-                    "error_x": round(float(movement_error_x), 2),
-                    "faces_detected": len(faces),
-                    "locked": bool(face_lock is not None),
-                    "locked_face_found": bool(locked_face_found),
-                }
-            )
-
-            evidence_logger.write(
-                {
-                    "event": "frame",
-                    "seq": int(status_seq),
-                    "timestamp": current_time,
-                    "timestamp_iso": datetime.fromtimestamp(current_time).isoformat(timespec="milliseconds"),
-                    "target": args.target_name,
-                    "status": status_payload,
-                    "recognized_faces": frame_match_records,
-                    "locked_face_bbox": locked_face_bbox,
-                    "motor_command": movement_command,
-                    "assessment_command": assessment_command_for(movement_command),
-                    "tracking_zone": tracking_zone,
-                    "horizontal_error_px": round(float(movement_error_x), 2),
-                    "raw_horizontal_error_px": round(float(raw_movement_error_x), 2),
-                    "center_zone_ratio": round(float(args.center_zone_ratio), 3),
-                    "center_zone_half_width_px": round(float(center_zone_half_width_px), 2),
-                    "deadzone_px": round(float(effective_deadzone_px), 2),
-                    "mqtt_movement_publish": mqtt_movement_result,
-                    "mqtt_status_publish": mqtt_status_result,
-                    "threshold": round(float(matcher.dist_thresh), 3),
-                }
-            )
+                mqtt_publisher.publish(movement_command)
+                mqtt_publisher.publish_status(status_payload)
             
-            if show_debug:
-                draw_center_zone_guides(vis, center_zone_half_width_px)
-
-            confidence_text = f"{target_match.similarity:.3f}" if target_match is not None else "-"
-            distance_text = f"{target_match.distance:.3f}" if target_match is not None else "-"
-            fps_text = f"{fps:.1f}" if fps is not None else "-"
-            lock_text = f"LOCKED: {face_lock.target_name}" if face_lock else "UNLOCKED"
-            found_text = "found" if locked_face_found else "not found"
-            movement_line = f"move={movement_command} zone={tracking_zone} err={movement_error_x:+.1f}px"
-            if movement_command in (MOVEMENT_SEARCH, MOVEMENT_IDLE):
-                movement_line = f"move={movement_command} zone={tracking_zone}"
-
-            accent = (85, 210, 160) if face_lock else (210, 210, 210)
-            if movement_command == MOVEMENT_SEARCH:
-                accent = (70, 150, 255)
-            elif movement_command in (MOVEMENT_LEFT, MOVEMENT_RIGHT):
-                accent = (80, 180, 255)
-
-            summary_lines = [
-                f"target={args.target_name}  {lock_text}",
-                movement_line,
-                f"faces={len(faces)}  locked_face={found_text}  fps={fps_text}",
-                f"confidence={confidence_text}  distance={distance_text}  threshold={matcher.dist_thresh:.3f}",
-            ]
-            debug_panel_width = min(410, max(300, w // 3)) if show_debug else 0
-            summary_width_limit = w - debug_panel_width - 36 if show_debug else w - 24
-            summary_width = max(300, min(560, summary_width_limit))
-            draw_info_panel(vis, "FACE LOCK TELEMETRY", summary_lines, (12, 12), summary_width, accent, 0.58)
-
-            if args.profile or show_debug:
-                last_profile["draw"] = (time.perf_counter() - frame_started_at) * 1000.0
-                profile_text = (
-                    f"CPU ms detect={last_profile['detect']:.1f} "
-                    f"rec={last_profile['recognize']:.1f} frame={last_profile['draw']:.1f}"
-                )
-                if current_time - profile_last_print_at >= 2.0:
-                    print(
-                        f"[profile] {profile_text} faces={len(faces)} "
-                        f"confidence={confidence_text} movement={movement_command} zone={tracking_zone}"
-                    )
-                    profile_last_print_at = current_time
-
-            if show_debug:
-                evidence_name = evidence_logger.path.name if evidence_logger.path is not None else "disabled"
-                debug_lines = [
-                    f"seq={status_seq}  provider={provider_name}",
-                    f"resolution={w}x{h}  center_zone={args.center_zone_ratio:.2f}",
-                    f"center_half={center_zone_half_width_px:.1f}px  deadzone={effective_deadzone_px:.1f}px",
-                    f"raw_err={raw_movement_error_x:+.1f}px  smooth_err={movement_error_x:+.1f}px",
-                    f"mqtt_move={mqtt_movement_result}  mqtt_status={mqtt_status_result}",
-                    f"profile detect={last_profile['detect']:.1f} rec={last_profile['recognize']:.1f} draw={last_profile['draw']:.1f}",
-                    f"evidence={evidence_name}",
-                ]
-                panel_width = debug_panel_width
-                draw_info_panel(
-                    vis,
-                    "DEBUG METRICS",
-                    debug_lines,
-                    (max(12, w - panel_width - 12), 12),
-                    panel_width,
-                    (210, 190, 120),
-                    0.66,
-                )
+            # Draw UI elements with proper spacing and modern styling
+            y_offset = 35
             
-            y_offset = h - 18
-            # Bottom status strip
+            # Main header with background box
+            header = f"IDs: {len(matcher._names)} | Threshold: {matcher.dist_thresh:.2f}"
+            if fps is not None:
+                header += f" | FPS: {fps:.1f}"
+            draw_text_box(vis, header, (12, y_offset), 0.75, (200, 255, 200), (20, 20, 20), 0.75, 6, cv2.FONT_HERSHEY_DUPLEX)
+            y_offset += 40
+
+            movement_text = f"MQTT movement: {movement_command}"
+            if movement_command in (MOVEMENT_LEFT, MOVEMENT_RIGHT, MOVEMENT_CENTER):
+                movement_text += f" (err_x={movement_error_x:+.1f}px)"
+            draw_text_with_shadow(vis, movement_text, (12, y_offset), 0.62, (180, 220, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
+            y_offset += 28
+
+            if locked_confidence_score is not None:
+                confidence_pct = max(0.0, min(100.0, locked_confidence_score * 100.0))
+                if confidence_pct >= 80.0:
+                    conf_color = (120, 255, 160)
+                    conf_quality = "HIGH"
+                elif confidence_pct >= 60.0:
+                    conf_color = (80, 210, 255)
+                    conf_quality = "MEDIUM"
+                else:
+                    conf_color = (90, 120, 255)
+                    conf_quality = "LOW"
+                confidence_text = f"Confidence: {confidence_pct:.1f}% ({conf_quality})"
+                if locked_match_distance is not None:
+                    confidence_text += f" | dist={locked_match_distance:.3f}"
+                draw_text_box(vis, confidence_text, (12, y_offset), 0.78, conf_color, (20, 20, 20), 0.76, 7, cv2.FONT_HERSHEY_DUPLEX)
+                y_offset += 38
+            elif face_lock:
+                draw_text_box(vis, "Confidence: no visible locked face", (12, y_offset), 0.72, (120, 160, 255), (30, 0, 0), 0.72, 7, cv2.FONT_HERSHEY_DUPLEX)
+                y_offset += 36
+            
+            # Lock status with enhanced styling
             if face_lock:
-                status_text = f"LOCKED: {face_lock.target_name} | frames={face_lock.consecutive_frames}"
-                status_text = f"LOCKED: {face_lock.target_name} | frames={face_lock.consecutive_frames}"
-                draw_text_box(vis, status_text, (12, y_offset), 0.58, (220, 245, 245), (16, 18, 19), 0.68, 6, cv2.FONT_HERSHEY_DUPLEX)
+                status_text = f"🔒 LOCKED ON: {face_lock.target_name} (Frames: {face_lock.consecutive_frames})"
+                draw_text_box(vis, status_text, (12, y_offset), 0.85, (255, 200, 100), (40, 20, 0), 0.8, 8, cv2.FONT_HERSHEY_DUPLEX)
                 y_offset += 40
                 
                 # Last action
                 if face_lock.history and len(face_lock.history) > 0:
                     last_action = face_lock.history[-1]
                     action_text = f"Last Action: {last_action.type.name} - {last_action.details}"
-                    draw_text_with_shadow(vis, action_text, (12, max(24, h - 52)), 0.55, (200, 255, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
+                    draw_text_with_shadow(vis, action_text, (12, h - 25), 0.65, (200, 255, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
             else:
                 if len(faces) > 1:
                     if selected_face_index is not None and selected_face_index < len(faces):
-                        status_text = f"Selected face {selected_face_index + 1}/{len(faces)} | arrows/a/f change | l locks"
+                        status_text = f"👤 Selected face {selected_face_index + 1}/{len(faces)} | ← → to change | 'l' to lock"
                     else:
-                        status_text = f"{len(faces)} faces detected | arrows/a/f select | l locks"
+                        status_text = f"👥 {len(faces)} faces detected | ← → to select | 'l' to lock"
                 elif len(faces) == 1:
-                    status_text = "Press l to lock the recognized face"
+                    status_text = f"👤 Press 'l' to lock the recognized face"
                 else:
-                    status_text = "No faces detected"
-                if len(faces) > 1 and selected_face_index is not None and selected_face_index < len(faces):
-                    status_text = f"Selected face {selected_face_index + 1}/{len(faces)} | arrows/a/f change | l locks"
-                elif len(faces) > 1:
-                    status_text = f"{len(faces)} faces detected | arrows/a/f select | l locks"
-                elif len(faces) == 1:
-                    status_text = "Press l to lock the recognized face"
-                else:
-                    status_text = "No faces detected"
-                draw_text_box(vis, status_text, (12, y_offset), 0.58, (220, 245, 245), (16, 18, 19), 0.68, 6, cv2.FONT_HERSHEY_DUPLEX)
+                    status_text = f"🔍 No faces detected"
+                draw_text_box(vis, status_text, (12, y_offset), 0.75, (200, 255, 200), (0, 40, 0), 0.7, 6, cv2.FONT_HERSHEY_DUPLEX)
                 y_offset += 40
             
-            cv2.imshow(window_name, vis)
-
             # Handle key presses
             key_raw = cv2.waitKey(1)
             key = key_raw & 0xFF
@@ -2092,13 +1328,14 @@ def main():
             if key == ord("q"):  # Quit
                 break
             elif key == ord("r"):  # Reload DB
-                reloaded_db = load_db_npz(db_path)
-                if args.target_name in reloaded_db:
-                    matcher.db = {args.target_name: reloaded_db[args.target_name]}
-                    matcher._rebuild()
-                    print(f"[recognize] reloaded target speaker: {args.target_name}")
-                else:
-                    print(f"[recognize] target speaker '{args.target_name}' not found; keeping current template")
+                matcher.reload_from(db_path)
+                if target_speaker:
+                    if target_speaker in matcher.db:
+                        matcher.db = {target_speaker: matcher.db[target_speaker]}
+                        matcher._rebuild()
+                    else:
+                        print(f"[recognize] target speaker '{target_speaker}' is missing after reload")
+                print(f"[recognize] reloaded DB: {len(matcher._names)} identities")
             elif key in (ord("+"), ord("=")):  # Increase threshold
                 matcher.dist_thresh = float(min(1.20, matcher.dist_thresh + 0.01))
                 print(f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})")
@@ -2108,144 +1345,52 @@ def main():
             elif key == ord("d"):  # Toggle debug
                 show_debug = not show_debug
                 print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
-            elif mqtt_publisher is not None and key == ord("1"):
-                result = mqtt_publisher.publish(MOVEMENT_LEFT, force=True)
-                print(f"[MQTT test] LEFT -> {assessment_command_for(MOVEMENT_LEFT)} ({result})")
-            elif mqtt_publisher is not None and key == ord("2"):
-                result = mqtt_publisher.publish(MOVEMENT_RIGHT, force=True)
-                print(f"[MQTT test] RIGHT -> {assessment_command_for(MOVEMENT_RIGHT)} ({result})")
-            elif mqtt_publisher is not None and key == ord("3"):
-                result = mqtt_publisher.publish(MOVEMENT_CENTER, force=True)
-                print(f"[MQTT test] CENTER -> {assessment_command_for(MOVEMENT_CENTER)} ({result})")
-            elif mqtt_publisher is not None and key == ord("4"):
-                result = mqtt_publisher.publish(MOVEMENT_SEARCH, force=True)
-                print(f"[MQTT test] SCAN -> {assessment_command_for(MOVEMENT_SEARCH)} ({result})")
-            elif mqtt_publisher is not None and key == ord("5"):
-                result = mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
-                print(f"[MQTT test] STOP -> {assessment_command_for(MOVEMENT_IDLE)} ({result})")
-            elif key in (ord("l"), ord("u")):  # Lock/unlock speaker
-                if face_lock:
-                    unlock_state = unlock_speaker(
-                        face_lock,
-                        current_time,
-                        "Manual unlock",
-                        mqtt_publisher,
-                    )
-                    face_lock = unlock_state["face_lock"]
-                    selected_face_index = unlock_state["selected_face_index"]
-                    potential_face_to_lock = unlock_state["potential_face_to_lock"]
-                    filtered_error_x = unlock_state["filtered_error_x"]
-                    stable_track_command = unlock_state["stable_track_command"]
-                    visible_movement_command = unlock_state["visible_movement_command"]
-                    visible_command_changed_at = unlock_state["visible_command_changed_at"]
-                    pending_track_command = unlock_state["pending_track_command"]
-                    pending_track_count = unlock_state["pending_track_count"]
-                    face_missing_since = unlock_state["face_missing_since"]
-                    reacquire_hold_until = unlock_state["reacquire_hold_until"]
-                    scan_started_logged = unlock_state["scan_started_logged"]
-                    searching_for_target = unlock_state["searching_for_target"]
-                # Only allow locking if we have a selected recognized face
-                elif potential_face_to_lock and potential_face_to_lock[0] is not None:
-                    name, emb, kps = potential_face_to_lock
-                    face_lock = FaceLock(
-                        target_name=name,
-                        target_emb=emb,
-                        last_seen=current_time
-                    )
-                    face_lock.update_position(kps)  # Initialize position tracking
-                    face_lock.history.append(Action(
-                        ActionType.FACE_LOCKED,
-                        current_time,
-                        f"Face locked: {name}"
-                    ))
+            elif key == ord('l'):  # Lock/unlock face
+                if face_lock:  # Unlock if already locked
+                    save_action_history(face_lock.target_name, face_lock.history)
+                    print(f"[FaceLock] Unlocked {face_lock.target_name}")
+                    face_lock = None
+                    selected_face_index = None
+                    potential_face_to_lock = None
                     filtered_error_x = None
                     stable_track_command = MOVEMENT_CENTER
-                    visible_movement_command = MOVEMENT_CENTER
-                    visible_command_changed_at = current_time
                     pending_track_command = None
                     pending_track_count = 0
                     face_missing_since = None
-                    reacquire_hold_until = 0.0
-                    scan_started_logged = False
+                    if mqtt_publisher is not None:
+                        mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
+                # Only allow locking if we have a selected recognized face
+                elif potential_face_to_lock and potential_face_to_lock[0] is not None:
+                    name, emb, kps = potential_face_to_lock
+                    face_lock = create_face_lock(name, emb, kps, current_time)
+                    filtered_error_x = None
+                    stable_track_command = MOVEMENT_CENTER
+                    pending_track_command = None
+                    pending_track_count = 0
+                    face_missing_since = None
                     print(f"[FaceLock] Locked onto {name} (face {selected_face_index + 1 if selected_face_index is not None else '?'})")
                     # Keep selection for visual feedback, but locking is done
+            
+            cv2.imshow("Face Recognition - Press 'q' to quit", vis)
     finally:
-        shutdown_time = time.time()
         if mqtt_publisher is not None:
-            shutdown_movement_result = mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
-            shutdown_status = {
-                "seq": int(status_seq + 1),
-                "timestamp": shutdown_time,
-                "movement": MOVEMENT_IDLE,
-                "error_x": 0.0,
-                "locked": False,
-                "target": args.target_name,
-                "locked_face_found": False,
-                "faces": 0,
-                "fps": None,
-                "threshold": round(float(matcher.dist_thresh), 3),
-                "provider": provider_name,
-                "target_similarity": None,
-                "target_distance": None,
-                "confidence": None,
-                "raw_error_x": 0.0,
-                "center_zone_ratio": round(float(args.center_zone_ratio), 3),
-                "center_zone_half_width_px": round(float(center_zone_half_width_px), 2),
-                "deadzone_px": round(float(effective_deadzone_px), 2),
-                "tracking_zone": "IDLE",
-                "resolution": {"width": int(args.camera_width), "height": int(args.camera_height)},
-                "profile_ms": {key: round(float(value), 2) for key, value in last_profile.items()},
-                "mqtt_connected": bool(mqtt_publisher.connected),
-                "shutdown": True,
-            }
-            shutdown_status_result = mqtt_publisher.publish_status(shutdown_status, force=True)
-        else:
-            shutdown_movement_result = "disabled"
-            shutdown_status_result = "disabled"
-            shutdown_status = {
-                "seq": int(status_seq + 1),
-                "timestamp": shutdown_time,
-                "movement": MOVEMENT_IDLE,
-                "error_x": 0.0,
-                "raw_error_x": 0.0,
-                "target": args.target_name,
-                "tracking_zone": "IDLE",
-                "locked": False,
-                "locked_face_found": False,
-                "faces": 0,
-                "fps": None,
-                "threshold": round(float(matcher.dist_thresh), 3),
-                "provider": provider_name,
-                "target_similarity": None,
-                "target_distance": None,
-                "confidence": None,
-                "center_zone_ratio": round(float(args.center_zone_ratio), 3),
-                "center_zone_half_width_px": round(float(center_zone_half_width_px), 2),
-                "deadzone_px": round(float(effective_deadzone_px), 2),
-                "resolution": {"width": int(args.camera_width), "height": int(args.camera_height)},
-                "profile_ms": {key: round(float(value), 2) for key, value in last_profile.items()},
-                "mqtt_connected": False,
-                "shutdown": True,
-            }
-
-        evidence_logger.write(
-            {
-                "event": "shutdown",
-                "seq": int(status_seq + 1),
-                "timestamp": shutdown_time,
-                "timestamp_iso": datetime.fromtimestamp(shutdown_time).isoformat(timespec="milliseconds"),
-                "target": args.target_name,
-                "status": shutdown_status,
-                "motor_command": MOVEMENT_IDLE,
-                "mqtt_movement_publish": shutdown_movement_result,
-                "mqtt_status_publish": shutdown_status_result,
-            },
-            force=True,
-        )
-        session_csv_logger.close()
-        evidence_logger.close()
-
-        if mqtt_publisher is not None:
+            mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
+            mqtt_publisher.publish_status(
+                {
+                    "timestamp": time.time(),
+                    "movement": MOVEMENT_IDLE,
+                    "error_x": 0.0,
+                    "locked": False,
+                    "target": None,
+                    "locked_face_found": False,
+                    "faces": 0,
+                    "fps": None,
+                    "threshold": round(float(matcher.dist_thresh), 3),
+                    "provider": provider_name,
+                    "shutdown": True,
+                },
+                force=True,
+            )
             mqtt_publisher.close()
         det.close()
         cap.release()
