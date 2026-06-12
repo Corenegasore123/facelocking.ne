@@ -495,6 +495,11 @@ MOVEMENT_RIGHT = "MOVED_RIGHT"
 MOVEMENT_CENTER = "CENTERED"
 MOVEMENT_SEARCH = "SEARCHING"
 MOVEMENT_IDLE = "STOPPED"
+TRACK_MOVEMENT_COMMANDS = frozenset({
+    MOVEMENT_LEFT,
+    MOVEMENT_RIGHT,
+    MOVEMENT_CENTER,
+})
 DEFAULT_MQTT_BROKER = "157.173.101.159"
 DEFAULT_MOVEMENT_TOPIC = "vision/Corene/servo_control"
 DEFAULT_STATUS_TOPIC = "vision/Corene/status"
@@ -653,10 +658,15 @@ class MqttMovementPublisher:
 
     def publish(self, command: str, force: bool = False):
         now = time.time()
+        keepalive_interval = (
+            min(self.min_publish_interval, 0.08)
+            if command in TRACK_MOVEMENT_COMMANDS
+            else self.min_publish_interval
+        )
         if (
             not force
             and command == self.last_command
-            and (now - self.last_publish_at) < self.min_publish_interval
+            and (now - self.last_publish_at) < keepalive_interval
         ):
             return
         if not self.connected:
@@ -732,7 +742,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--deadzone-px",
         type=float,
-        default=80.0,
+        default=45.0,
         help="Horizontal pixel deadzone around frame center for CENTERED command.",
     )
     parser.add_argument(
@@ -906,6 +916,7 @@ def main():
     fps: Optional[float] = None
     show_debug = False
     movement_command = MOVEMENT_IDLE
+    prev_movement_command = MOVEMENT_IDLE
     movement_error_x = 0.0
     filtered_error_x: Optional[float] = None
     stable_track_command = MOVEMENT_CENTER
@@ -1063,6 +1074,16 @@ def main():
                 else:
                     stable_label = raw_label
                 
+                # Re-acquire locked speaker by embedding (faster than label smoothing during SEARCH).
+                if face_lock is not None and not locked_face_found:
+                    lock_dist = cosine_distance(emb, face_lock.target_emb)
+                    if lock_dist < matcher.dist_thresh:
+                        locked_face_found = True
+                        locked_face_kps = f.kps.copy()
+                        locked_confidence_score = 1.0 - lock_dist
+                        locked_match_distance = lock_dist
+                        face_lock.update_position(f.kps)
+
                 # Check if this is our locked face
                 is_locked_face = False
                 if face_lock and mr.name == face_lock.target_name and mr.accepted:
@@ -1160,8 +1181,15 @@ def main():
 
             # Movement command for ESP servo.
             # Track left/right while the locked speaker is visible; sweep/search when missing.
+            just_reacquired = False
             if face_lock and locked_face_found and locked_face_kps is not None:
+                just_reacquired = face_missing_since is not None
                 face_missing_since = None
+                if just_reacquired:
+                    filtered_error_x = None
+                    stable_track_command = MOVEMENT_CENTER
+                    pending_track_command = None
+                    pending_track_count = 0
                 raw_error_x = compute_face_error_x(locked_face_kps, frame_width=w)
                 if filtered_error_x is None:
                     filtered_error_x = raw_error_x
@@ -1193,7 +1221,10 @@ def main():
                         pending_track_command = None
                         pending_track_count = 0
 
-                movement_command = stable_track_command
+                if just_reacquired:
+                    movement_command = MOVEMENT_IDLE
+                else:
+                    movement_command = stable_track_command
             elif face_lock:
                 if face_missing_since is None:
                     face_missing_since = current_time
@@ -1232,8 +1263,16 @@ def main():
             operational_logger.log_status(status_payload)
 
             if mqtt_publisher is not None:
-                mqtt_publisher.publish(movement_command)
+                leaving_search = (
+                    prev_movement_command == MOVEMENT_SEARCH
+                    and movement_command != MOVEMENT_SEARCH
+                )
+                mqtt_publisher.publish(
+                    movement_command,
+                    force=just_reacquired or leaving_search,
+                )
                 mqtt_publisher.publish_status(status_payload)
+            prev_movement_command = movement_command
             
             # Draw UI elements with proper spacing and modern styling
             y_offset = 35

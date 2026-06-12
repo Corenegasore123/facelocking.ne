@@ -30,7 +30,8 @@ const int SEARCH_STEP = 1;
 
 const unsigned long TRACK_INTERVAL_MS = 55;
 const unsigned long SEARCH_INTERVAL_MS = 90;
-const unsigned long COMMAND_TIMEOUT_MS = 800;
+// LEFT/RIGHT only move while fresh MQTT arrives; SEARCH ignores this timeout.
+const unsigned long TRACK_COMMAND_TIMEOUT_MS = 1200;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 
@@ -205,11 +206,6 @@ bool connectMqtt() {
 void handleServo() {
   unsigned long now = millis();
 
-  // Keep SEARCHING until PC sends STOPPED after re-acquiring the speaker.
-  if (currentCommand != CMD_SEARCH && (now - lastCommandAt) > COMMAND_TIMEOUT_MS) {
-    currentCommand = CMD_IDLE;
-  }
-
   if (currentCommand == CMD_CENTER) {
     currentCommand = CMD_IDLE;
     return;
@@ -222,7 +218,15 @@ void handleServo() {
     setServoAngle(servoAngle + (sweepDirection * SEARCH_STEP));
     if (servoAngle >= SERVO_MAX_ANGLE) sweepDirection = -1;
     if (servoAngle <= SERVO_MIN_ANGLE) sweepDirection = 1;
-    lastCommandAt = now;
+    return;
+  }
+
+  // MOVED_LEFT/RIGHT expire unless the PC keeps publishing (search uses STOPPED/CENTERED to end).
+  if (
+      (currentCommand == CMD_LEFT || currentCommand == CMD_RIGHT) &&
+      (now - lastCommandAt) > TRACK_COMMAND_TIMEOUT_MS
+  ) {
+    currentCommand = CMD_IDLE;
     return;
   }
 
@@ -231,10 +235,8 @@ void handleServo() {
 
   if (currentCommand == CMD_LEFT) {
     applyTrackingStep(-1);
-    lastCommandAt = now;
   } else if (currentCommand == CMD_RIGHT) {
     applyTrackingStep(1);
-    lastCommandAt = now;
   }
 }
 
