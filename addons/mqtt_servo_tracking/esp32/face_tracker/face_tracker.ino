@@ -17,7 +17,7 @@ const char* WIFI_PASSWORD = "@mindurbusiness";
 
 const char* MQTT_SERVER = "157.173.101.159";
 const uint16_t MQTT_PORT = 1883;
-const char* MQTT_TOPIC = "vision/Corene/movement";
+const char* MQTT_TOPIC = "vision/Corene/servo_control";
 const char* MQTT_CLIENT_ID_PREFIX = "corene-face-servo";
 
 const uint8_t SERVO_PIN = 15;  // D8 / GPIO15

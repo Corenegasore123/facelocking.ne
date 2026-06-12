@@ -44,7 +44,7 @@ Tracker controls: `l` / `u` lock/unlock, `q` quit, `d` debug, `+`/`-` threshold.
 | Broker | `157.173.101.159` |
 | Port | `1883` |
 | Dashboard WebSocket | `ws://157.173.101.159:9001` |
-| Movement topic | `vision/Corene/movement` |
+| Movement topic | `vision/Corene/servo_control` |
 | Status topic | `vision/Corene/status` |
 
 ### BENAX motor commands (published on movement topic)
