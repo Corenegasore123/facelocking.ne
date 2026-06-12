@@ -1,16 +1,18 @@
 /*
- * Corene ESP32 face-tracking servo controller (MQTT subscriber).
+ * BENAX / Corene — ESP32 pan servo (MQTT subscriber).
+ * Use this sketch only (ESP32 Dev Module). Do not flash ESP8266 code.
  *
  * Board:  ESP32 Dev Module
  * Libs:   PubSubClient, ESP32Servo
  *
  * Wiring:
- *   Servo BROWN  -> GND
- *   Servo RED    -> 5V (VIN / external 5V supply; not 3V3)
+ *   Servo BROWN  -> GND (common with ESP32 GND)
+ *   Servo RED    -> 5V external supply (not 3V3)
  *   Servo YELLOW -> D14 (GPIO14)
  *
- * Serial Monitor @ 115200: LEFT, RIGHT, CENTER, SEARCH, IDLE
- * BENAX aliases: MOVED_LEFT, MOVED_RIGHT, CENTERED, STOPPED, OUT_OF_FRAME
+ * Commands (from recognize_mqtt.py):
+ *   MOVED_LEFT, MOVED_RIGHT, CENTERED, OUT_OF_FRAME, STOPPED
+ *   Also: LEFT, RIGHT, CENTER, SEARCH, IDLE, SCAN
  */
 #define USE_US_TIMER
 
@@ -22,7 +24,7 @@ const char* WIFI_SSID = "EdNet";
 const char* WIFI_PASSWORD = "Huawei@123";// =========================
 // MQTT Settings
 // =========================
-const char* MQTT_SERVER = "broker.hivemq.com";
+const char* MQTT_SERVER = "157.173.101.159";
 const uint16_t MQTT_PORT = 1883;
 
 const char* MQTT_TOPIC = "vision/Corene/movement";
@@ -293,10 +295,9 @@ void handleServo() {
 
   unsigned long now = millis();
 
-  // Auto idle timeout for tracking commands only.
-  // SEARCH keeps sweeping until LEFT/RIGHT/CENTER/IDLE explicitly stops it.
+  // Only STOPPED/IDLE times out. LEFT, RIGHT, SEARCH run until a new MQTT command arrives.
   if (
-      currentCommand != CMD_SEARCH &&
+      currentCommand == CMD_IDLE &&
       (now - lastCommandAt) > COMMAND_TIMEOUT_MS
   ) {
     currentCommand = CMD_IDLE;
@@ -341,6 +342,7 @@ void handleServo() {
       sweepDirection = 1;
     }
 
+    lastCommandAt = now;
     return;
   }
 
@@ -357,14 +359,11 @@ void handleServo() {
   lastMoveAt = now;
 
   if (currentCommand == CMD_LEFT) {
-
     applyTrackingStep(-1);
-
-  } else if (
-      currentCommand == CMD_RIGHT
-  ) {
-
+    lastCommandAt = now;
+  } else if (currentCommand == CMD_RIGHT) {
     applyTrackingStep(1);
+    lastCommandAt = now;
   }
 }
 

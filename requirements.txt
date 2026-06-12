@@ -5,3 +5,4 @@ mediapipe
 onnxruntime
 scipy
 paho-mqtt
+pandas

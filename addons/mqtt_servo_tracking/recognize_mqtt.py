@@ -19,6 +19,7 @@ Since embeddings are L2-normalized, cosine_similarity = dot(a,b).
 """
 from __future__ import annotations
 import argparse
+import csv
 import json
 import time
 import os
@@ -70,10 +71,6 @@ class ActionType(Enum):
     FACE_REACQUIRED = auto()
     FACE_UNLOCKED = auto()
     SCAN_STARTED = auto()
-    HEAD_LEFT = auto()
-    HEAD_RIGHT = auto()
-    EYE_BLINK = auto()
-    SMILE = auto()
 
 @dataclass
 class Action:
@@ -87,52 +84,15 @@ class FaceLock:
     target_emb: np.ndarray
     last_seen: float = field(default_factory=time.time)
     last_position: Optional[Tuple[float, float]] = None
-    last_eye_dist: Optional[float] = None
-    last_mouth_size: Optional[float] = None
     history: List[Action] = field(default_factory=list)
     consecutive_frames: int = 0
-    
-    def update_position(self, kps: np.ndarray) -> List[Action]:
-        actions = []
-        current_time = time.time()
-        
-        # Calculate face center
-        center_x = kps[:, 0].mean()
-        center_y = kps[:, 1].mean()
-        
-        # Detect head movement
-        if self.last_position is not None:
-            dx = center_x - self.last_position[0]
-            if dx > 10:  # Threshold for right movement
-                actions.append(Action(ActionType.HEAD_RIGHT, current_time, f"Moved right by {dx:.1f}px"))
-            elif dx < -10:  # Threshold for left movement
-                actions.append(Action(ActionType.HEAD_LEFT, current_time, f"Moved left by {abs(dx):.1f}px"))
-        
-        # Detect eye blink (using vertical distance between eyes and nose)
-        eye_level = (kps[0, 1] + kps[1, 1]) / 2  # Average y of both eyes
-        nose_y = kps[2, 1]
-        eye_dist = abs(eye_level - nose_y)
-        
-        if self.last_eye_dist is not None:
-            if eye_dist < self.last_eye_dist * 0.7:  # Threshold for blink
-                actions.append(Action(ActionType.EYE_BLINK, current_time, "Blink detected"))
-        
-        # Detect smile (using mouth width/height ratio)
-        mouth_width = abs(kps[3, 0] - kps[4, 0])
-        mouth_height = abs(kps[3, 1] - kps[4, 1])
-        mouth_ratio = mouth_width / (mouth_height + 1e-5)
-        
-        if self.last_mouth_size is not None and mouth_ratio > 1.5 * self.last_mouth_size:
-            actions.append(Action(ActionType.SMILE, current_time, f"Smile detected (ratio: {mouth_ratio:.2f})"))
-        
-        # Update state
+
+    def update_position(self, kps: np.ndarray) -> None:
+        center_x = float(kps[:, 0].mean())
+        center_y = float(kps[:, 1].mean())
         self.last_position = (center_x, center_y)
-        self.last_eye_dist = eye_dist
-        self.last_mouth_size = mouth_ratio
-        self.last_seen = current_time
+        self.last_seen = time.time()
         self.consecutive_frames += 1
-        
-        return actions
 
 @dataclass
 class MatchResult:
@@ -619,14 +579,15 @@ ASSESSMENT_COMMAND_MAP = {
     MOVEMENT_SEARCH: "OUT_OF_FRAME",
     MOVEMENT_IDLE: "STOPPED",
 }
-DEFAULT_MQTT_BROKER = "broker.hivemq.com"
+DEFAULT_MQTT_BROKER = "157.173.101.159"
+DEFAULT_MQTT_WS_URL = "ws://157.173.101.159:9001"
 DEFAULT_MOVEMENT_TOPIC = "vision/Corene/movement"
 DEFAULT_STATUS_TOPIC = "vision/Corene/status"
 DEFAULT_TARGET_NAME = "Corene"
 DEFAULT_CAMERA_WIDTH = 960
 DEFAULT_CAMERA_HEIGHT = 540
 DEFAULT_LANDMARK_ROI_WIDTH = 224
-DEFAULT_CENTER_ZONE_RATIO = 0.36
+DEFAULT_CENTER_ZONE_RATIO = 0.22
 
 
 def compute_face_error_x(kps: np.ndarray, frame_width: int) -> float:
@@ -772,14 +733,14 @@ class MqttMovementPublisher:
 
     def publish(self, command: str, force: bool = False) -> str:
         now = time.time()
-        search_keepalive = (
-            command == MOVEMENT_SEARCH
-            and self.last_command == MOVEMENT_SEARCH
-            and (now - self.last_publish_at) >= max(0.35, self.min_publish_interval)
+        movement_keepalive = (
+            command in (MOVEMENT_LEFT, MOVEMENT_RIGHT, MOVEMENT_SEARCH)
+            and self.last_command == command
+            and (now - self.last_publish_at) >= self.min_publish_interval
         )
         if (
             not force
-            and not search_keepalive
+            and not movement_keepalive
             and command == self.last_command
             and (now - self.last_publish_at) < self.min_publish_interval
         ):
@@ -787,7 +748,8 @@ class MqttMovementPublisher:
         if not self.connected:
             return "disconnected"
 
-        info = self.client.publish(self.topic, payload=command, qos=0, retain=False)
+        wire_command = assessment_command_for(command)
+        info = self.client.publish(self.topic, payload=wire_command, qos=0, retain=False)
         if info.rc == mqtt.MQTT_ERR_SUCCESS:
             self.last_command = command
             self.last_publish_at = now
@@ -851,6 +813,61 @@ class EvidenceLogger:
         if self._fh is not None:
             self._fh.close()
             self._fh = None
+
+
+class SessionCsvLogger:
+    """BENAX session CSV: speaker ID, confidence, timestamps, motor commands."""
+
+    FIELDNAMES = [
+        "timestamp",
+        "iso_time",
+        "speaker_id",
+        "confidence",
+        "movement_command",
+        "assessment_command",
+        "error_x",
+        "faces_detected",
+        "locked",
+        "locked_face_found",
+    ]
+
+    def __init__(self, log_dir: Path, min_interval_sec: float = 0.25, enabled: bool = True):
+        self.enabled = bool(enabled)
+        self.min_interval_sec = float(max(0.0, min_interval_sec))
+        self.last_write_at = 0.0
+        self.path: Optional[Path] = None
+        self._fh: Optional[TextIO] = None
+        self._writer: Optional[csv.DictWriter] = None
+
+        if not self.enabled:
+            return
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = log_dir / f"session_{stamp}.csv"
+        self._fh = self.path.open("a", encoding="utf-8", newline="")
+        self._writer = csv.DictWriter(self._fh, fieldnames=self.FIELDNAMES)
+        self._writer.writeheader()
+        self._fh.flush()
+        print(f"[CSV] Session log: {self.path}")
+
+    def write(self, row: Dict[str, object], force: bool = False) -> None:
+        if not self.enabled or self._writer is None or self._fh is None:
+            return
+
+        now = time.time()
+        if not force and (now - self.last_write_at) < self.min_interval_sec:
+            return
+
+        self._writer.writerow({key: row.get(key, "") for key in self.FIELDNAMES})
+        self._fh.flush()
+        self.last_write_at = now
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+            self._writer = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -942,7 +959,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-unlock-sec",
         type=float,
-        default=30.0,
+        default=0.0,
         help="Unlock speaker if still lost/searching after this many seconds (0 = disabled).",
     )
     parser.add_argument(
@@ -994,6 +1011,22 @@ def parse_args() -> argparse.Namespace:
         "--disable-evidence-log",
         action="store_true",
         help="Disable structured JSONL operational evidence logging.",
+    )
+    parser.add_argument(
+        "--csv-log-dir",
+        default="logs",
+        help="Directory for BENAX session CSV logs (session_YYYYMMDD_HHMMSS.csv).",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=float,
+        default=0.25,
+        help="Minimum seconds between CSV session log rows.",
+    )
+    parser.add_argument(
+        "--disable-csv-log",
+        action="store_true",
+        help="Disable CSV session logging.",
     )
     return parser.parse_args()
 
@@ -1228,6 +1261,7 @@ def main():
     args.unlock_timeout_sec = float(max(0.0, args.unlock_timeout_sec))
     args.search_unlock_sec = float(max(0.0, args.search_unlock_sec))
     args.evidence_log_interval_sec = float(max(0.0, args.evidence_log_interval_sec))
+    args.log_interval = float(max(0.0, args.log_interval))
     args.mqtt_min_interval = float(max(0.0, args.mqtt_min_interval))
     args.mqtt_status_min_interval = float(max(0.0, args.mqtt_status_min_interval))
     args.deadzone_px = float(max(0.0, args.deadzone_px))
@@ -1325,6 +1359,7 @@ def main():
     print("Controls: q=quit, r=reload DB, +/- threshold, d=debug overlay")
     print("          LEFT/RIGHT arrows (or a/f keys) to select face")
     print("          l or u = lock / unlock speaker")
+    print("          1=LEFT 2=RIGHT 3=CENTER 4=SCAN 5=STOP (direct MQTT servo test)")
     if args.unlock_timeout_sec > 0:
         print(f"Auto-unlock: after {args.unlock_timeout_sec:.0f}s if speaker not seen")
     if args.search_unlock_sec > 0:
@@ -1336,6 +1371,8 @@ def main():
     )
     if not args.disable_mqtt:
         print(f"MQTT dashboard status topic: {args.mqtt_status_topic}")
+        print(f"MQTT WebSocket (dashboard): {DEFAULT_MQTT_WS_URL}")
+        print("MQTT movement payloads (BENAX): MOVED_LEFT, MOVED_RIGHT, CENTERED, OUT_OF_FRAME, STOPPED")
     t0 = time.time()
     frames = 0
     fps: Optional[float] = None
@@ -1362,13 +1399,17 @@ def main():
     last_detect_frame = -9999
     faces: List[FaceDet] = []
     face_cache: Dict[int, CachedFace] = {}
-    last_action_print_at: Dict[ActionType, float] = {}
     profile_last_print_at = 0.0
     last_profile: Dict[str, float] = {"detect": 0.0, "recognize": 0.0, "draw": 0.0}
     evidence_logger = EvidenceLogger(
         log_dir=Path(args.evidence_log_dir),
         min_interval_sec=args.evidence_log_interval_sec,
         enabled=not args.disable_evidence_log,
+    )
+    session_csv_logger = SessionCsvLogger(
+        log_dir=Path(args.csv_log_dir),
+        min_interval_sec=args.log_interval,
+        enabled=not args.disable_csv_log,
     )
 
     if args.disable_mqtt:
@@ -1387,10 +1428,23 @@ def main():
                 status_min_publish_interval=args.mqtt_status_min_interval,
             )
             mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
+            connect_deadline = time.time() + 15.0
+            while not mqtt_publisher.connected and time.time() < connect_deadline:
+                time.sleep(0.15)
+            if mqtt_publisher.connected:
+                print("[MQTT] Broker connected — motor commands enabled")
+            else:
+                print(
+                    f"[MQTT] WARNING: Not connected to {args.mqtt_broker}:{args.mqtt_port}. "
+                    "Servo will not move until the broker is reachable."
+                )
         except Exception as e:
             print(f"[MQTT] Failed to initialize publisher: {e}")
             mqtt_publisher = None
     
+    last_logged_mqtt_command: Optional[str] = None
+    last_mqtt_warn_at = 0.0
+
     # Face locking state
     face_lock: Optional[FaceLock] = None
     
@@ -1499,16 +1553,7 @@ def main():
                 if face_lock and (
                     (mr.name == face_lock.target_name and mr.accepted) or lock_emb_match
                 ):
-                    # Update face lock with new position and detect actions
-                    actions = []
-                    for action in face_lock.update_position(f.kps):
-                        last_at = last_action_print_at.get(action.type, 0.0)
-                        if current_time - last_at >= 0.7:
-                            actions.append(action)
-                            last_action_print_at[action.type] = current_time
-                    face_lock.history.extend(actions)
-                    for action in actions:
-                        print(f"[Action] {action.type.name}: {action.details}")
+                    face_lock.update_position(f.kps)
                     is_locked_face = True
                     locked_face_found = True
                     locked_face_kps = f.kps.copy()
@@ -1850,23 +1895,45 @@ def main():
                 profile_ms=last_profile,
             )
             status_payload["mqtt_connected"] = bool(mqtt_publisher is not None and mqtt_publisher.connected)
-            status_payload["assessment_command"] = assessment_command_for(movement_command)
+            status_payload["movement_internal"] = movement_command
+            status_payload["movement"] = assessment_command_for(movement_command)
+            status_payload["assessment_command"] = status_payload["movement"]
 
             mqtt_movement_result = "disabled"
             mqtt_status_result = "disabled"
             if mqtt_publisher is not None:
-                force_movement_publish = (
-                    movement_command == MOVEMENT_SEARCH
-                    and mqtt_publisher.last_command != MOVEMENT_SEARCH
-                ) or (
-                    movement_command != MOVEMENT_SEARCH
-                    and mqtt_publisher.last_command == MOVEMENT_SEARCH
-                )
+                force_movement_publish = movement_command != mqtt_publisher.last_command
                 mqtt_movement_result = mqtt_publisher.publish(
                     movement_command,
                     force=force_movement_publish,
                 )
                 mqtt_status_result = mqtt_publisher.publish_status(status_payload)
+                wire_cmd = assessment_command_for(movement_command)
+                if mqtt_movement_result == "published" and wire_cmd != last_logged_mqtt_command:
+                    print(f"[MQTT] >> {wire_cmd}")
+                    last_logged_mqtt_command = wire_cmd
+                elif mqtt_movement_result == "disconnected" and (current_time - last_mqtt_warn_at) >= 5.0:
+                    print(f"[MQTT] disconnected — cannot reach {args.mqtt_broker}:{args.mqtt_port}")
+                    last_mqtt_warn_at = current_time
+
+            session_csv_logger.write(
+                {
+                    "timestamp": round(current_time, 3),
+                    "iso_time": datetime.fromtimestamp(current_time).isoformat(timespec="milliseconds"),
+                    "speaker_id": face_lock.target_name if face_lock else args.target_name,
+                    "confidence": (
+                        round(float(target_match.similarity), 4)
+                        if target_match is not None
+                        else ""
+                    ),
+                    "movement_command": movement_command,
+                    "assessment_command": assessment_command_for(movement_command),
+                    "error_x": round(float(movement_error_x), 2),
+                    "faces_detected": len(faces),
+                    "locked": bool(face_lock is not None),
+                    "locked_face_found": bool(locked_face_found),
+                }
+            )
 
             evidence_logger.write(
                 {
@@ -2041,6 +2108,21 @@ def main():
             elif key == ord("d"):  # Toggle debug
                 show_debug = not show_debug
                 print(f"[recognize] debug overlay: {'ON' if show_debug else 'OFF'}")
+            elif mqtt_publisher is not None and key == ord("1"):
+                result = mqtt_publisher.publish(MOVEMENT_LEFT, force=True)
+                print(f"[MQTT test] LEFT -> {assessment_command_for(MOVEMENT_LEFT)} ({result})")
+            elif mqtt_publisher is not None and key == ord("2"):
+                result = mqtt_publisher.publish(MOVEMENT_RIGHT, force=True)
+                print(f"[MQTT test] RIGHT -> {assessment_command_for(MOVEMENT_RIGHT)} ({result})")
+            elif mqtt_publisher is not None and key == ord("3"):
+                result = mqtt_publisher.publish(MOVEMENT_CENTER, force=True)
+                print(f"[MQTT test] CENTER -> {assessment_command_for(MOVEMENT_CENTER)} ({result})")
+            elif mqtt_publisher is not None and key == ord("4"):
+                result = mqtt_publisher.publish(MOVEMENT_SEARCH, force=True)
+                print(f"[MQTT test] SCAN -> {assessment_command_for(MOVEMENT_SEARCH)} ({result})")
+            elif mqtt_publisher is not None and key == ord("5"):
+                result = mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
+                print(f"[MQTT test] STOP -> {assessment_command_for(MOVEMENT_IDLE)} ({result})")
             elif key in (ord("l"), ord("u")):  # Lock/unlock speaker
                 if face_lock:
                     unlock_state = unlock_speaker(
@@ -2160,6 +2242,7 @@ def main():
             },
             force=True,
         )
+        session_csv_logger.close()
         evidence_logger.close()
 
         if mqtt_publisher is not None:

@@ -57,10 +57,6 @@ class FaceDet:
 class ActionType(Enum):
     FACE_LOCKED = auto()
     FACE_LOST = auto()
-    HEAD_LEFT = auto()
-    HEAD_RIGHT = auto()
-    EYE_BLINK = auto()
-    SMILE = auto()
 
 @dataclass
 class Action:
@@ -74,52 +70,15 @@ class FaceLock:
     target_emb: np.ndarray
     last_seen: float = field(default_factory=time.time)
     last_position: Optional[Tuple[float, float]] = None
-    last_eye_dist: Optional[float] = None
-    last_mouth_size: Optional[float] = None
     history: List[Action] = field(default_factory=list)
     consecutive_frames: int = 0
-    
-    def update_position(self, kps: np.ndarray) -> List[Action]:
-        actions = []
-        current_time = time.time()
-        
-        # Calculate face center
-        center_x = kps[:, 0].mean()
-        center_y = kps[:, 1].mean()
-        
-        # Detect head movement
-        if self.last_position is not None:
-            dx = center_x - self.last_position[0]
-            if dx > 10:  # Threshold for right movement
-                actions.append(Action(ActionType.HEAD_RIGHT, current_time, f"Moved right by {dx:.1f}px"))
-            elif dx < -10:  # Threshold for left movement
-                actions.append(Action(ActionType.HEAD_LEFT, current_time, f"Moved left by {abs(dx):.1f}px"))
-        
-        # Detect eye blink (using vertical distance between eyes and nose)
-        eye_level = (kps[0, 1] + kps[1, 1]) / 2  # Average y of both eyes
-        nose_y = kps[2, 1]
-        eye_dist = abs(eye_level - nose_y)
-        
-        if self.last_eye_dist is not None:
-            if eye_dist < self.last_eye_dist * 0.7:  # Threshold for blink
-                actions.append(Action(ActionType.EYE_BLINK, current_time, "Blink detected"))
-        
-        # Detect smile (using mouth width/height ratio)
-        mouth_width = abs(kps[3, 0] - kps[4, 0])
-        mouth_height = abs(kps[3, 1] - kps[4, 1])
-        mouth_ratio = mouth_width / (mouth_height + 1e-5)
-        
-        if self.last_mouth_size is not None and mouth_ratio > 1.5 * self.last_mouth_size:
-            actions.append(Action(ActionType.SMILE, current_time, f"Smile detected (ratio: {mouth_ratio:.2f})"))
-        
-        # Update state
+
+    def update_position(self, kps: np.ndarray) -> None:
+        center_x = float(kps[:, 0].mean())
+        center_y = float(kps[:, 1].mean())
         self.last_position = (center_x, center_y)
-        self.last_eye_dist = eye_dist
-        self.last_mouth_size = mouth_ratio
-        self.last_seen = current_time
+        self.last_seen = time.time()
         self.consecutive_frames += 1
-        
-        return actions
 
 @dataclass
 class MatchResult:
@@ -842,16 +801,7 @@ def main():
                 # Check if this is our locked face
                 is_locked_face = False
                 if face_lock and mr.name == face_lock.target_name and mr.accepted:
-                    # Update face lock with new position and detect actions
-                    actions = []
-                    for action in face_lock.update_position(f.kps):
-                        last_at = last_action_print_at.get(action.type, 0.0)
-                        if current_time - last_at >= 0.7:
-                            actions.append(action)
-                            last_action_print_at[action.type] = current_time
-                    face_lock.history.extend(actions)
-                    for action in actions:
-                        print(f"[Action] {action.type.name}: {action.details}")
+                    face_lock.update_position(f.kps)
                     is_locked_face = True
                 
                 # label (use smoothed/stable label for display to reduce flicker)

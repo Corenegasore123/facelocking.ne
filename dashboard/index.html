@@ -582,7 +582,7 @@
                 <div class="controls">
                     <div class="field">
                         <label>MQTT WebSocket URL</label>
-                        <input id="wsUrlInput" type="text" value="ws://broker.hivemq.com:8000/mqtt">
+                        <input id="wsUrlInput" type="text" value="ws://157.173.101.159:9001">
                     </div>
                     <div class="field">
                         <label>Movement topic</label>
@@ -809,6 +809,19 @@
 
         function normalizeMovement(command) {
             const clean = String(command || "IDLE").toUpperCase();
+            const aliases = {
+                MOVED_LEFT: "LEFT",
+                MOVE_LEFT: "LEFT",
+                MOVED_RIGHT: "RIGHT",
+                MOVE_RIGHT: "RIGHT",
+                CENTERED: "CENTER",
+                STOPPED: "IDLE",
+                STOP: "IDLE",
+                OUT_OF_FRAME: "SEARCH",
+                SCAN: "SEARCH",
+                NO_FACE: "SEARCH",
+            };
+            if (aliases[clean]) return aliases[clean];
             return ["LEFT", "RIGHT", "CENTER", "SEARCH", "IDLE"].includes(clean) ? clean : "IDLE";
         }
 
