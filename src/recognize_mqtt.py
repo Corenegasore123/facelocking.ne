@@ -103,9 +103,9 @@ class FaceLock:
         if self.last_position is not None:
             dx = center_x - self.last_position[0]
             # Increased thresholds to reduce noise
-            if dx > 20:  # Threshold for right movement (was 10)
+            if dx > 40:
                 actions.append(Action(ActionType.HEAD_RIGHT, current_time, f"Moved right by {dx:.1f}px"))
-            elif dx < -20:  # Threshold for left movement (was -10)
+            elif dx < -40:
                 actions.append(Action(ActionType.HEAD_LEFT, current_time, f"Moved left by {abs(dx):.1f}px"))
         
         # Detect eye blink (using vertical distance between eyes and nose)
@@ -518,17 +518,52 @@ def command_from_error_with_hysteresis(
     error_x: float,
     deadzone_px: float,
     center_exit_hysteresis_px: float,
+    side_switch_hysteresis_px: float,
     previous_command: str,
 ) -> str:
-    if previous_command == MOVEMENT_CENTER:
-        if abs(error_x) <= (float(deadzone_px) + float(center_exit_hysteresis_px)):
-            return MOVEMENT_CENTER
+    """Deadband + sticky LEFT/RIGHT/CENTER to stop command bouncing at boundaries."""
+    dz = float(deadzone_px)
+    exit_center = dz + float(center_exit_hysteresis_px)
+    side_switch = dz + float(side_switch_hysteresis_px)
 
-    if abs(error_x) <= float(deadzone_px):
+    if previous_command == MOVEMENT_CENTER:
+        if error_x <= -exit_center:
+            return MOVEMENT_LEFT
+        if error_x >= exit_center:
+            return MOVEMENT_RIGHT
+        return MOVEMENT_CENTER
+
+    if previous_command == MOVEMENT_LEFT:
+        if error_x >= side_switch:
+            return MOVEMENT_RIGHT
+        if error_x > -dz:
+            return MOVEMENT_CENTER
+        return MOVEMENT_LEFT
+
+    if previous_command == MOVEMENT_RIGHT:
+        if error_x <= -side_switch:
+            return MOVEMENT_LEFT
+        if error_x < dz:
+            return MOVEMENT_CENTER
+        return MOVEMENT_RIGHT
+
+    if abs(error_x) <= dz:
         return MOVEMENT_CENTER
     if error_x < 0:
         return MOVEMENT_LEFT
     return MOVEMENT_RIGHT
+
+
+def smooth_keypoints(
+    previous: Optional[np.ndarray],
+    current: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    if previous is None or previous.shape != current.shape:
+        return current.copy()
+    a = float(max(0.05, min(1.0, alpha)))
+    blended = a * current + (1.0 - a) * previous
+    return blended.astype(np.float32)
 
 
 def build_dashboard_status(
@@ -684,16 +719,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mqtt-topic", default=DEFAULT_MOVEMENT_TOPIC, help="MQTT topic to publish movement commands.")
     parser.add_argument("--mqtt-status-topic", default=DEFAULT_STATUS_TOPIC, help="MQTT topic to publish dashboard status JSON.")
     parser.add_argument("--mqtt-client-id", default=f"face-lock-{int(time.time())}", help="MQTT client id.")
-    parser.add_argument("--deadzone-px", type=float, default=80.0, help="Horizontal pixel deadzone around frame center for CENTER command.")
-    parser.add_argument("--center-exit-hysteresis-px", type=float, default=30.0, help="Extra pixels required to leave CENTER and start LEFT/RIGHT movement.")
-    parser.add_argument("--error-smooth-alpha", type=float, default=0.35, help="EMA smoothing factor for horizontal error (0..1). Lower = smoother.")
-    parser.add_argument("--command-confirm-frames", type=int, default=2, help="How many consecutive frames are needed before changing LEFT/RIGHT/CENTER.")
-    parser.add_argument("--search-delay-sec", type=float, default=1.5, help="Delay before sending SEARCH after the locked face is temporarily lost.")
-    parser.add_argument("--mqtt-min-interval", type=float, default=0.15, help="Minimum seconds between repeated identical MQTT commands.")
+    parser.add_argument("--deadzone-px", type=float, default=cfg.deadzone_px, help="Horizontal pixel deadzone around frame center.")
+    parser.add_argument("--center-exit-hysteresis-px", type=float, default=cfg.center_exit_hysteresis_px, help="Extra pixels to leave CENTER before LEFT/RIGHT.")
+    parser.add_argument("--side-switch-hysteresis-px", type=float, default=cfg.side_switch_hysteresis_px, help="Extra pixels to flip LEFT <-> RIGHT directly.")
+    parser.add_argument("--track-hold-frames", type=int, default=cfg.track_hold_frames, help="Keep lock through brief detection gaps.")
+    parser.add_argument("--kps-smooth-alpha", type=float, default=cfg.kps_smooth_alpha, help="EMA smoothing for locked face keypoints (0..1).")
+    parser.add_argument("--error-smooth-alpha", type=float, default=cfg.error_smooth_alpha, help="EMA smoothing for horizontal error (0..1). Lower = smoother.")
+    parser.add_argument("--command-confirm-frames", type=int, default=cfg.command_confirm_frames, help="Frames needed before changing LEFT/RIGHT/CENTER.")
+    parser.add_argument("--search-delay-sec", type=float, default=cfg.search_delay_sec, help="Delay before SEARCH after face lost.")
+    parser.add_argument("--mqtt-min-interval", type=float, default=cfg.track_publish_interval_sec, help="Min seconds between identical MQTT commands.")
     parser.add_argument("--mqtt-status-min-interval", type=float, default=0.25, help="Minimum seconds between dashboard status MQTT messages.")
     parser.add_argument("--mqtt-search-heartbeat", type=float, default=0.2, help="Seconds between SEARCH heartbeat re-publishes.")
-    parser.add_argument("--lock-timeout-sec", type=float, default=30.0, help="Seconds the locked target may be missing before auto-unlock. 0 keeps the lock forever.")
-    parser.add_argument("--lost-confirm-frames", type=int, default=8, help="Consecutive frames face must be missing before declaring LOST.")
+    parser.add_argument("--lock-timeout-sec", type=float, default=cfg.unlock_timeout_sec, help="Seconds before auto-unlock when face missing.")
+    parser.add_argument("--lost-confirm-frames", type=int, default=cfg.search_missing_frames, help="Frames missing before declared lost.")
     parser.add_argument("--found-confirm-frames", type=int, default=4, help="Consecutive frames face must be found before declaring REACQUIRED.")
     parser.add_argument("--camera-index", type=int, default=cfg.camera_index, help="OpenCV camera index.")
     parser.add_argument("--disable-mqtt", action="store_true", help="Run face lock tracking without MQTT publishing.")
@@ -792,6 +830,9 @@ def main():
     args.mqtt_search_heartbeat = float(max(0.0, args.mqtt_search_heartbeat))
     args.lock_timeout_sec = float(max(0.0, args.lock_timeout_sec))
     args.center_exit_hysteresis_px = float(max(0.0, args.center_exit_hysteresis_px))
+    args.side_switch_hysteresis_px = float(max(0.0, args.side_switch_hysteresis_px))
+    args.track_hold_frames = int(max(0, args.track_hold_frames))
+    args.kps_smooth_alpha = float(max(0.05, min(1.0, args.kps_smooth_alpha)))
     args.lost_confirm_frames = int(max(1, args.lost_confirm_frames))
     args.found_confirm_frames = int(max(1, args.found_confirm_frames))
     
@@ -870,6 +911,10 @@ def main():
     pending_track_count = 0
     face_missing_since: Optional[float] = None
     search_active = False
+    last_locked_center: Optional[Tuple[float, float]] = None
+    last_locked_kps: Optional[np.ndarray] = None
+    smoothed_locked_kps: Optional[np.ndarray] = None
+    locks_missing_streak = 0
     mqtt_publisher: Optional[MqttMovementPublisher] = None
 
     if args.disable_mqtt:
@@ -943,6 +988,10 @@ def main():
                 pending_track_count = 0
                 face_missing_since = None
                 search_active = False
+                last_locked_center = None
+                last_locked_kps = None
+                smoothed_locked_kps = None
+                locks_missing_streak = 0
                 face_lost_counter = 0
                 face_found_counter = 0
                 if mqtt_publisher is not None:
@@ -960,6 +1009,7 @@ def main():
             locked_face_found = False
             locked_face_kps: Optional[np.ndarray] = None
             locked_face_match: Optional[MatchResult] = None
+            best_lock_match: Optional[Tuple[float, float, int]] = None
 
             for i, f in enumerate(faces):
                 cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
@@ -1004,17 +1054,27 @@ def main():
                         stable_label = "Unknown"
                 else:
                     stable_label = raw_label
-                
-                is_locked_face = False
-                if face_lock and mr.name == face_lock.target_name and mr.accepted:
-                    actions = face_lock.update_position(f.kps)
-                    face_lock.history.extend(actions)
-                    for action in actions:
-                        print(f"[Action] {action.type.name}: {action.details}")
-                    is_locked_face = True
-                    locked_face_found = True
-                    locked_face_kps = f.kps.copy()
-                    locked_face_match = mr
+
+                if face_lock is not None:
+                    lock_dist = cosine_distance(emb, face_lock.target_emb)
+                    if lock_dist < matcher.dist_thresh:
+                        center_x = float(np.mean(f.kps[:, 0]))
+                        center_y = float(np.mean(f.kps[:, 1]))
+                        if last_locked_center is not None:
+                            dx = center_x - last_locked_center[0]
+                            dy = center_y - last_locked_center[1]
+                            distance_penalty = min(((dx * dx) + (dy * dy)) ** 0.5 / 1000.0, 0.25)
+                            lock_score = (1.0 - lock_dist) - distance_penalty
+                        else:
+                            lock_score = 1.0 - lock_dist
+                        if best_lock_match is None or lock_score > best_lock_match[0]:
+                            best_lock_match = (lock_score, lock_dist, i)
+
+                is_locked_face = (
+                    face_lock is not None
+                    and best_lock_match is not None
+                    and i == best_lock_match[2]
+                )
                 
                 label = stable_label
                 status = " (LOCKED)" if is_locked_face else ""
@@ -1065,6 +1125,56 @@ def main():
                     dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
                     draw_text_with_shadow(vis, dbg, (10, h - 20), 0.65, (255, 255, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
 
+            locked_face_detected = False
+            if face_lock is not None and best_lock_match is not None:
+                locked_face_found = True
+                locked_face_detected = True
+                lock_idx = best_lock_match[2]
+                lock_dist = best_lock_match[1]
+                raw_kps = faces[lock_idx].kps.copy()
+                smoothed_locked_kps = smooth_keypoints(
+                    smoothed_locked_kps, raw_kps, args.kps_smooth_alpha,
+                )
+                locked_face_kps = smoothed_locked_kps
+                last_locked_kps = smoothed_locked_kps.copy()
+                last_locked_center = (
+                    float(np.mean(locked_face_kps[:, 0])),
+                    float(np.mean(locked_face_kps[:, 1])),
+                )
+                locked_face_match = MatchResult(
+                    name=face_lock.target_name,
+                    distance=lock_dist,
+                    similarity=1.0 - lock_dist,
+                    accepted=True,
+                )
+                if show_debug:
+                    actions = face_lock.update_position(locked_face_kps)
+                    face_lock.history.extend(actions)
+                else:
+                    face_lock.last_seen = time.time()
+                    face_lock.consecutive_frames += 1
+            elif (
+                face_lock is not None
+                and last_locked_kps is not None
+                and locks_missing_streak < args.track_hold_frames
+            ):
+                locked_face_found = True
+                locked_face_kps = last_locked_kps.copy()
+                if locked_face_match is None and face_lock is not None:
+                    locked_face_match = MatchResult(
+                        name=face_lock.target_name,
+                        distance=matcher.dist_thresh,
+                        similarity=1.0 - matcher.dist_thresh,
+                        accepted=True,
+                    )
+
+            if face_lock and locked_face_detected:
+                locks_missing_streak = 0
+            elif face_lock and locked_face_found:
+                locks_missing_streak += 1
+            elif face_lock:
+                locks_missing_streak += 1
+
             # ============================================================
             # MOVEMENT COMMAND WITH LOSS/REACQUIRE HYSTERESIS
             # ============================================================
@@ -1102,6 +1212,7 @@ def main():
                         error_x=movement_error_x,
                         deadzone_px=args.deadzone_px,
                         center_exit_hysteresis_px=args.center_exit_hysteresis_px,
+                        side_switch_hysteresis_px=args.side_switch_hysteresis_px,
                         previous_command=stable_track_command,
                     )
 
@@ -1127,7 +1238,10 @@ def main():
 
             elif face_lock:
                 face_found_counter = 0
-                face_lost_counter += 1
+                if not locked_face_found:
+                    face_lost_counter += 1
+                else:
+                    face_lost_counter = 0
 
                 if face_missing_since is None:
                     if face_lost_counter >= lost_confirm_frames:
@@ -1342,6 +1456,10 @@ def main():
                     pending_track_count = 0
                     face_missing_since = None
                     search_active = False
+                    last_locked_center = None
+                    last_locked_kps = None
+                    smoothed_locked_kps = None
+                    locks_missing_streak = 0
                     face_lost_counter = 0
                     face_found_counter = 0
                     if mqtt_publisher is not None:
@@ -1350,6 +1468,10 @@ def main():
                     name, emb, kps = potential_face_to_lock
                     face_lock = FaceLock(target_name=name, target_emb=emb, last_seen=current_time)
                     face_lock.update_position(kps)
+                    last_locked_kps = kps.copy()
+                    smoothed_locked_kps = kps.copy()
+                    last_locked_center = (float(np.mean(kps[:, 0])), float(np.mean(kps[:, 1])))
+                    locks_missing_streak = 0
                     face_lock.history.append(Action(ActionType.FACE_LOCKED, current_time, f"Locked: {name}"))
                     filtered_error_x = None
                     stable_track_command = MOVEMENT_CENTER
