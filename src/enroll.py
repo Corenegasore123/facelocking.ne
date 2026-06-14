@@ -20,7 +20,6 @@ Controls:
 - q: quit
 """
 from __future__ import annotations
-import argparse
 import json
 import time
 import os
@@ -29,8 +28,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-from .vision.haar_5pt import Haar5ptDetector, align_face_5pt
-from .vision.embed import ArcFaceEmbedderONNX
+from .haar_5pt import Haar5ptDetector, align_face_5pt
+from .embed import ArcFaceEmbedderONNX
 
 # -------------------------
 # Config
@@ -208,19 +207,7 @@ def draw_status(
 # -------------------------
 # Main
 # -------------------------
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Enroll a speaker into the face database.")
-    parser.add_argument(
-        "--camera-index",
-        type=int,
-        default=0,
-        help="OpenCV camera index (run: python -m src.list_cameras).",
-    )
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
     cfg = EnrollConfig()
     ensure_dirs(cfg)
     name = input("Enter person name to enroll (e.g., Alice): ").strip()
@@ -244,12 +231,9 @@ def main():
     
     auto = False
     last_auto = 0.0
-    cap = cv2.VideoCapture(args.camera_index)
+    cap = cv2.VideoCapture(1)
     if not cap.isOpened():
-        raise RuntimeError(
-            f"Failed to open camera index {args.camera_index}. "
-            f"Run: python -m src.list_cameras"
-        )
+        raise RuntimeError("Failed to open camera.")
     
     cv2.namedWindow(cfg.window_main, cv2.WINDOW_NORMAL)
     cv2.namedWindow(cfg.window_aligned, cv2.WINDOW_NORMAL)
@@ -335,27 +319,6 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             
             if key == ord("q"):
-                total = len(base_samples) + len(new_samples)
-                if total >= max(3, cfg.samples_needed // 2):
-                    all_samples = base_samples + new_samples
-                    template = mean_embedding(all_samples)
-                    db[name] = template
-                    meta = {
-                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "embedding_dim": int(template.size),
-                        "names": sorted(db.keys()),
-                        "samples_existing_used": int(len(base_samples)),
-                        "samples_new_used": int(len(new_samples)),
-                        "samples_total_used": int(len(all_samples)),
-                        "note": "Auto-saved on quit. Embeddings are L2-normalized vectors.",
-                    }
-                    save_db(cfg, db, meta)
-                    print(f"Auto-saved '{name}' to {cfg.out_db_npz} ({total} samples).")
-                elif total > 0:
-                    print(
-                        f"Not saved: need at least {max(3, cfg.samples_needed // 2)} samples "
-                        f"(have {total}). Press 's' to save manually next time."
-                    )
                 break
             if key == ord("a"):
                 auto = not auto

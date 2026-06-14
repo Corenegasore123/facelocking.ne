@@ -791,7 +791,7 @@ def main():
     
     matcher = FaceDBMatcher(db=db, dist_thresh=0.40)
     
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print(f"Camera not available (index 1). Try a different --camera-index.")
         det.close()
