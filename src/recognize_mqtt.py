@@ -862,12 +862,14 @@ def main():
     fps: Optional[float] = None
     show_debug = False
     movement_command = MOVEMENT_IDLE
+    prev_movement_command = MOVEMENT_IDLE
     movement_error_x = 0.0
     filtered_error_x: Optional[float] = None
     stable_track_command = MOVEMENT_CENTER
     pending_track_command: Optional[str] = None
     pending_track_count = 0
     face_missing_since: Optional[float] = None
+    search_active = False
     mqtt_publisher: Optional[MqttMovementPublisher] = None
 
     if args.disable_mqtt:
@@ -940,6 +942,7 @@ def main():
                 pending_track_command = None
                 pending_track_count = 0
                 face_missing_since = None
+                search_active = False
                 face_lost_counter = 0
                 face_found_counter = 0
                 if mqtt_publisher is not None:
@@ -1065,23 +1068,25 @@ def main():
             # ============================================================
             # MOVEMENT COMMAND WITH LOSS/REACQUIRE HYSTERESIS
             # ============================================================
+            reacquired_from_search = False
             if face_lock and locked_face_found:
-                # Face IS found this frame
-                face_lost_counter = 0  # Reset lost counter
-                
-                if face_missing_since is not None:
-                    # Was previously lost, now confirming reacquire
-                    face_found_counter += 1
-                    if face_found_counter >= found_confirm_frames:
-                        print(f"[FaceLock] {face_lock.target_name} REACQUIRED - tracking")
-                        face_missing_since = None
-                        face_found_counter = 0
-                        filtered_error_x = None  # Reset filter on reacquire
-                    # During reacquire confirmation, hold CENTER
-                    movement_command = MOVEMENT_CENTER
+                face_lost_counter = 0
+
+                if face_missing_since is not None or search_active:
+                    # Face found while searching — stop servo immediately (IDLE)
+                    if search_active or face_missing_since is not None:
+                        print(f"[FaceLock] {face_lock.target_name} FOUND — stopping search")
+                    search_active = False
+                    face_missing_since = None
+                    face_found_counter = 0
+                    filtered_error_x = None
+                    stable_track_command = MOVEMENT_CENTER
+                    pending_track_command = None
+                    pending_track_count = 0
+                    movement_command = MOVEMENT_IDLE
                     movement_error_x = 0.0
+                    reacquired_from_search = True
                 else:
-                    # Normal tracking - face is visible
                     face_found_counter = 0
                     raw_error_x = compute_face_error_x(locked_face_kps, frame_width=w)
                     if filtered_error_x is None:
@@ -1114,31 +1119,35 @@ def main():
                             pending_track_command = None
                             pending_track_count = 0
 
-                    movement_command = stable_track_command
-                    
+                    # In deadzone hold still (IDLE stops micro-steps on ESP32)
+                    if stable_track_command == MOVEMENT_CENTER:
+                        movement_command = MOVEMENT_IDLE
+                    else:
+                        movement_command = stable_track_command
+
             elif face_lock:
-                # Face is NOT found this frame
-                face_found_counter = 0  # Reset found counter
+                face_found_counter = 0
                 face_lost_counter += 1
-                
+
                 if face_missing_since is None:
-                    # Not yet declared lost - need confirmation
                     if face_lost_counter >= lost_confirm_frames:
                         face_missing_since = current_time
-                        print(f"[FaceLock] {face_lock.target_name} LOST - holding lock, will SEARCH after {args.search_delay_sec}s")
+                        print(
+                            f"[FaceLock] {face_lock.target_name} LOST — "
+                            f"will SEARCH after {args.search_delay_sec}s"
+                        )
                         face_lost_counter = 0
-                    movement_command = MOVEMENT_CENTER
+                    movement_command = MOVEMENT_IDLE
                 else:
-                    # Already declared lost
                     lost_for = current_time - face_missing_since
                     if lost_for < args.search_delay_sec:
-                        movement_command = MOVEMENT_CENTER
+                        movement_command = MOVEMENT_IDLE
                     else:
                         movement_command = MOVEMENT_SEARCH
-                
+                        search_active = True
+
                 movement_error_x = 0.0
             else:
-                # No lock at all
                 face_lost_counter = 0
                 face_found_counter = 0
                 filtered_error_x = None
@@ -1146,6 +1155,7 @@ def main():
                 pending_track_command = None
                 pending_track_count = 0
                 face_missing_since = None
+                search_active = False
                 movement_command = MOVEMENT_IDLE
                 movement_error_x = 0.0
 
@@ -1176,8 +1186,16 @@ def main():
             )
 
             if mqtt_publisher is not None:
-                mqtt_publisher.publish(movement_command)
+                leaving_search = (
+                    prev_movement_command == MOVEMENT_SEARCH
+                    and movement_command != MOVEMENT_SEARCH
+                )
+                mqtt_publisher.publish(
+                    movement_command,
+                    force=leaving_search or reacquired_from_search,
+                )
                 mqtt_publisher.publish_status(status_payload)
+            prev_movement_command = movement_command
             
             session_logger.log(
                 locked_target=face_lock.target_name if face_lock else None,
@@ -1223,8 +1241,10 @@ def main():
             y_offset += 40
 
             movement_text = f"MQTT movement: {movement_command}"
-            if movement_command in (MOVEMENT_LEFT, MOVEMENT_RIGHT, MOVEMENT_CENTER):
+            if movement_command in (MOVEMENT_LEFT, MOVEMENT_RIGHT):
                 movement_text += f" (err_x={movement_error_x:+.1f}px)"
+            elif search_active:
+                movement_text += " (searching…)"
             draw_text_with_shadow(vis, movement_text, (12, y_offset), 0.62, (180, 220, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
             y_offset += 28
 
@@ -1321,6 +1341,7 @@ def main():
                     pending_track_command = None
                     pending_track_count = 0
                     face_missing_since = None
+                    search_active = False
                     face_lost_counter = 0
                     face_found_counter = 0
                     if mqtt_publisher is not None:
