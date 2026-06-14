@@ -504,6 +504,7 @@ MOVEMENT_RIGHT = cfg.cmd_right
 MOVEMENT_CENTER = cfg.cmd_center
 MOVEMENT_SEARCH = cfg.cmd_search
 MOVEMENT_IDLE = cfg.cmd_stop
+TRACK_MOVEMENT_COMMANDS = frozenset({MOVEMENT_LEFT, MOVEMENT_RIGHT})
 DEFAULT_MQTT_BROKER = cfg.mqtt_broker
 DEFAULT_MOVEMENT_TOPIC = cfg.movement_topic
 DEFAULT_STATUS_TOPIC = cfg.status_topic
@@ -614,12 +615,14 @@ class MqttMovementPublisher:
         min_publish_interval: float = 0.15,
         status_min_publish_interval: float = 0.25,
         heartbeat_interval: float = 0.2,
+        track_keepalive_interval: float = 1.0,
     ):
         self.topic = topic
         self.status_topic = status_topic
         self.min_publish_interval = float(max(0.0, min_publish_interval))
         self.status_min_publish_interval = float(max(0.0, status_min_publish_interval))
         self.heartbeat_interval = float(max(0.0, heartbeat_interval))
+        self.track_keepalive_interval = float(max(0.0, track_keepalive_interval))
         self.last_command: Optional[str] = None
         self.last_publish_at = 0.0
         self.last_status_publish_at = 0.0
@@ -673,10 +676,16 @@ class MqttMovementPublisher:
 
     def publish(self, command: str, force: bool = False):
         now = time.time()
+        if command in TRACK_MOVEMENT_COMMANDS:
+            repeat_interval = self.track_keepalive_interval
+        elif command == MOVEMENT_SEARCH:
+            repeat_interval = self.heartbeat_interval
+        else:
+            repeat_interval = self.min_publish_interval
         if (
             not force
             and command == self.last_command
-            and (now - self.last_publish_at) < self.min_publish_interval
+            and (now - self.last_publish_at) < repeat_interval
         ):
             return
         if not self.connected:
@@ -729,7 +738,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-delay-sec", type=float, default=cfg.search_delay_sec, help="Delay before SEARCH after face lost.")
     parser.add_argument("--mqtt-min-interval", type=float, default=cfg.track_publish_interval_sec, help="Min seconds between identical MQTT commands.")
     parser.add_argument("--mqtt-status-min-interval", type=float, default=0.25, help="Minimum seconds between dashboard status MQTT messages.")
-    parser.add_argument("--mqtt-search-heartbeat", type=float, default=0.2, help="Seconds between SEARCH heartbeat re-publishes.")
+    parser.add_argument("--mqtt-search-heartbeat", type=float, default=cfg.search_mqtt_heartbeat_sec, help="Seconds between SEARCH heartbeat re-publishes.")
+    parser.add_argument("--track-keepalive-sec", type=float, default=cfg.track_keepalive_sec, help="Seconds between LEFT/RIGHT keepalive re-publishes.")
     parser.add_argument("--lock-timeout-sec", type=float, default=cfg.unlock_timeout_sec, help="Seconds before auto-unlock when face missing.")
     parser.add_argument("--lost-confirm-frames", type=int, default=cfg.search_missing_frames, help="Frames missing before declared lost.")
     parser.add_argument("--found-confirm-frames", type=int, default=4, help="Consecutive frames face must be found before declaring REACQUIRED.")
@@ -828,6 +838,7 @@ def main():
     args.mqtt_min_interval = float(max(0.0, args.mqtt_min_interval))
     args.mqtt_status_min_interval = float(max(0.0, args.mqtt_status_min_interval))
     args.mqtt_search_heartbeat = float(max(0.0, args.mqtt_search_heartbeat))
+    args.track_keepalive_sec = float(max(0.2, args.track_keepalive_sec))
     args.lock_timeout_sec = float(max(0.0, args.lock_timeout_sec))
     args.center_exit_hysteresis_px = float(max(0.0, args.center_exit_hysteresis_px))
     args.side_switch_hysteresis_px = float(max(0.0, args.side_switch_hysteresis_px))
@@ -930,6 +941,7 @@ def main():
                 min_publish_interval=args.mqtt_min_interval,
                 status_min_publish_interval=args.mqtt_status_min_interval,
                 heartbeat_interval=args.mqtt_search_heartbeat,
+                track_keepalive_interval=args.track_keepalive_sec,
             )
             mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
         except Exception as e:
@@ -1472,6 +1484,7 @@ def main():
                     smoothed_locked_kps = kps.copy()
                     last_locked_center = (float(np.mean(kps[:, 0])), float(np.mean(kps[:, 1])))
                     locks_missing_streak = 0
+                    face_lock.update_position(kps)
                     face_lock.history.append(Action(ActionType.FACE_LOCKED, current_time, f"Locked: {name}"))
                     filtered_error_x = None
                     stable_track_command = MOVEMENT_CENTER

@@ -49,10 +49,12 @@ class CoreneConfig:
     deadzone_px: float = 65.0
     center_exit_hysteresis_px: float = 45.0
     side_switch_hysteresis_px: float = 35.0
-    error_smooth_alpha: float = 0.22
+    error_smooth_alpha: float = 0.18
     kps_smooth_alpha: float = 0.4
     command_confirm_frames: int = 4
-    track_publish_interval_sec: float = 0.2
+    track_publish_interval_sec: float = 0.28
+    track_keepalive_sec: float = 1.0
+    search_mqtt_heartbeat_sec: float = 0.45
     track_hold_frames: int = 10
     search_missing_frames: int = 12
     reacquire_frames: int = 5
