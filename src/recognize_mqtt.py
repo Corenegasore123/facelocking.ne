@@ -537,17 +537,30 @@ def build_dashboard_status(
     face_lock: Optional[FaceLock],
     faces_count: int,
     locked_face_found: bool,
+    confidence_score: Optional[float],
+    match_distance: Optional[float],
     fps: Optional[float],
     threshold: float,
     provider_name: str,
+    status_seq: int,
 ) -> Dict[str, object]:
+    confidence_pct = (
+        round(max(0.0, min(100.0, float(confidence_score) * 100.0)), 1)
+        if confidence_score is not None
+        else None
+    )
     return {
+        "seq": int(status_seq),
         "timestamp": time.time(),
         "movement": movement_command,
         "error_x": round(float(movement_error_x), 2),
         "locked": face_lock is not None,
         "target": face_lock.target_name if face_lock else None,
         "locked_face_found": bool(locked_face_found),
+        "confidence": round(float(confidence_score), 4) if confidence_score is not None else None,
+        "confidence_score": round(float(confidence_score), 4) if confidence_score is not None else None,
+        "confidence_pct": confidence_pct,
+        "match_distance": round(float(match_distance), 4) if match_distance is not None else None,
         "faces": int(faces_count),
         "fps": round(float(fps), 2) if fps is not None else None,
         "threshold": round(float(threshold), 3),
@@ -692,8 +705,8 @@ def parse_args() -> argparse.Namespace:
 class SessionLogger:
     FIELDS = [
         "timestamp_iso", "epoch", "locked_target", "recognized",
-        "similarity", "distance", "accepted", "movement",
-        "error_x", "faces", "fps",
+        "confidence_score", "confidence_pct", "similarity", "distance", "accepted",
+        "movement", "error_x", "faces", "fps",
     ]
 
     def __init__(self, path: Path, min_interval: float = 1.0):
@@ -707,16 +720,38 @@ class SessionLogger:
         self._writer.writerow(self.FIELDS)
         self._f.flush()
 
-    def log(self, *, locked_target, recognized, similarity, distance, accepted, movement, error_x, faces, fps, force=False):
+    def log(
+        self,
+        *,
+        locked_target,
+        recognized,
+        confidence_score,
+        similarity,
+        distance,
+        accepted,
+        movement,
+        error_x,
+        faces,
+        fps,
+        force=False,
+    ):
         now = time.time()
-        key = (locked_target, recognized, movement)
+        conf_key = round(float(confidence_score), 3) if confidence_score is not None else None
+        key = (locked_target, recognized, movement, conf_key)
         if not force and key == self._last_key and (now - self._last_at) < self.min_interval:
             return
         self._last_at = now
         self._last_key = key
         iso = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        conf_pct = (
+            f"{max(0.0, min(100.0, float(confidence_score) * 100.0)):.1f}"
+            if confidence_score is not None
+            else ""
+        )
         self._writer.writerow([
             iso, f"{now:.3f}", locked_target or "", recognized or "",
+            f"{confidence_score:.4f}" if confidence_score is not None else "",
+            conf_pct,
             f"{similarity:.4f}" if similarity is not None else "",
             f"{distance:.4f}" if distance is not None else "",
             "" if accepted is None else int(bool(accepted)),
@@ -818,7 +853,9 @@ def main():
     session_logger = SessionLogger(
         cfg.logs_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     )
-    print(f"[LOG] Evidence log -> {session_logger.path}")
+    print(f"[LOG] Session log -> {session_logger.path}")
+    status_seq = 0
+    last_logged_confidence: Optional[float] = None
     
     t0 = time.time()
     frames = 0
@@ -979,7 +1016,8 @@ def main():
                 label = stable_label
                 status = " (LOCKED)" if is_locked_face else ""
                 line1 = f"{label}{status}"
-                line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
+                confidence_pct = max(0.0, min(100.0, mr.similarity * 100.0))
+                line2 = f"conf={confidence_pct:.1f}% dist={mr.distance:.3f}"
                 
                 is_selected = (selected_face_index == i) if selected_face_index is not None else False
                 
@@ -1111,32 +1149,70 @@ def main():
                 movement_command = MOVEMENT_IDLE
                 movement_error_x = 0.0
 
+            locked_confidence_score: Optional[float] = (
+                float(locked_face_match.similarity)
+                if locked_face_match is not None and locked_face_match.accepted
+                else None
+            )
+            locked_match_distance: Optional[float] = (
+                float(locked_face_match.distance)
+                if locked_face_match is not None
+                else None
+            )
+
+            status_seq += 1
+            status_payload = build_dashboard_status(
+                movement_command=movement_command,
+                movement_error_x=movement_error_x,
+                face_lock=face_lock,
+                faces_count=len(faces),
+                locked_face_found=locked_face_found,
+                confidence_score=locked_confidence_score,
+                match_distance=locked_match_distance,
+                fps=fps,
+                threshold=matcher.dist_thresh,
+                provider_name=provider_name,
+                status_seq=status_seq,
+            )
+
             if mqtt_publisher is not None:
                 mqtt_publisher.publish(movement_command)
-                mqtt_publisher.publish_status(
-                    build_dashboard_status(
-                        movement_command=movement_command,
-                        movement_error_x=movement_error_x,
-                        face_lock=face_lock,
-                        faces_count=len(faces),
-                        locked_face_found=locked_face_found,
-                        fps=fps,
-                        threshold=matcher.dist_thresh,
-                        provider_name=provider_name,
-                    )
-                )
+                mqtt_publisher.publish_status(status_payload)
             
             session_logger.log(
                 locked_target=face_lock.target_name if face_lock else None,
                 recognized=(locked_face_match.name if (locked_face_match and locked_face_match.accepted) else None),
+                confidence_score=locked_confidence_score,
                 similarity=locked_face_match.similarity if locked_face_match else None,
-                distance=locked_face_match.distance if locked_face_match else None,
+                distance=locked_match_distance,
                 accepted=locked_face_match.accepted if locked_face_match else None,
                 movement=movement_command,
                 error_x=movement_error_x,
                 faces=len(faces),
                 fps=fps,
             )
+
+            if (
+                locked_confidence_score is not None
+                and (
+                    last_logged_confidence is None
+                    or abs(locked_confidence_score - last_logged_confidence) >= 0.03
+                )
+            ):
+                conf_pct = locked_confidence_score * 100.0
+                dist_txt = (
+                    f" dist={locked_match_distance:.3f}"
+                    if locked_match_distance is not None
+                    else ""
+                )
+                print(
+                    f"[Confidence] {face_lock.target_name if face_lock else '?'}: "
+                    f"{conf_pct:.1f}%{dist_txt}"
+                )
+                last_logged_confidence = locked_confidence_score
+            elif locked_confidence_score is None and last_logged_confidence is not None:
+                print("[Confidence] no locked face match this frame")
+                last_logged_confidence = None
 
             # Draw UI
             y_offset = 35
@@ -1151,6 +1227,29 @@ def main():
                 movement_text += f" (err_x={movement_error_x:+.1f}px)"
             draw_text_with_shadow(vis, movement_text, (12, y_offset), 0.62, (180, 220, 255), 1, font=cv2.FONT_HERSHEY_DUPLEX)
             y_offset += 28
+
+            if locked_confidence_score is not None:
+                conf_pct = max(0.0, min(100.0, locked_confidence_score * 100.0))
+                if conf_pct >= 80.0:
+                    conf_color = (120, 255, 160)
+                    conf_label = "HIGH"
+                elif conf_pct >= 60.0:
+                    conf_color = (80, 210, 255)
+                    conf_label = "MEDIUM"
+                else:
+                    conf_color = (90, 120, 255)
+                    conf_label = "LOW"
+                conf_text = f"Confidence: {conf_pct:.1f}% ({conf_label})"
+                if locked_match_distance is not None:
+                    conf_text += f" | dist={locked_match_distance:.3f}"
+                draw_text_box(vis, conf_text, (12, y_offset), 0.78, conf_color, (20, 20, 20), 0.76, 7, cv2.FONT_HERSHEY_DUPLEX)
+                y_offset += 38
+            elif face_lock:
+                draw_text_box(
+                    vis, "Confidence: no visible locked face",
+                    (12, y_offset), 0.72, (120, 160, 255), (30, 0, 0), 0.72, 7, cv2.FONT_HERSHEY_DUPLEX,
+                )
+                y_offset += 36
             
             if face_lock:
                 status_text = f"LOCKED ON: {face_lock.target_name}"
@@ -1245,9 +1344,12 @@ def main():
         if mqtt_publisher is not None:
             mqtt_publisher.publish(MOVEMENT_IDLE, force=True)
             mqtt_publisher.publish_status({
+                "seq": status_seq + 1,
                 "timestamp": time.time(), "movement": MOVEMENT_IDLE,
                 "error_x": 0.0, "locked": False, "target": None,
-                "locked_face_found": False, "faces": 0, "fps": None,
+                "locked_face_found": False, "confidence": None,
+                "confidence_score": None, "confidence_pct": None,
+                "match_distance": None, "faces": 0, "fps": None,
                 "threshold": round(float(matcher.dist_thresh), 3),
                 "provider": provider_name, "shutdown": True,
             }, force=True)

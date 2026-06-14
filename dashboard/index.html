@@ -7,7 +7,6 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <style>
         :root {
             --bg-0: #070b12;
@@ -472,7 +471,13 @@
 
         .log-list .kind.movement { color: var(--amber); }
         .log-list .kind.status { color: var(--green); }
+        .log-list .kind.confidence { color: #7dd3fc; }
         .log-list .kind.error { color: var(--red); }
+
+        .stat strong.conf-high { color: #86efac; }
+        .stat strong.conf-med { color: #7dd3fc; }
+        .stat strong.conf-low { color: #fca5a5; }
+        .stat .sub { display: block; font-size: 0.72rem; color: var(--muted); font-weight: 400; margin-top: 2px; }
 
         @media (max-width: 900px) {
             .layout { grid-template-columns: 1fr; }
@@ -548,6 +553,11 @@
                     <div class="stat">
                         <label>Confidence</label>
                         <strong id="confidenceValue">-</strong>
+                        <span id="confidenceMeta" class="sub"></span>
+                    </div>
+                    <div class="stat">
+                        <label>Match dist</label>
+                        <strong id="distanceValue">-</strong>
                     </div>
                     <div class="stat">
                         <label>FPS</label>
@@ -581,8 +591,9 @@
 
                 <div class="controls">
                     <div class="field">
-                        <label>MQTT WebSocket URL</label>
-                        <input id="wsUrlInput" type="text" value="ws://157.173.101.159:9001">
+                        <label>Relay WebSocket URL</label>
+                        <input id="wsUrlInput" type="text" value="ws://127.0.0.1:5501">
+                        <span class="sub">Run: python -m src.dashboard.websocket_backend</span>
                     </div>
                     <div class="field">
                         <label>Movement topic</label>
@@ -619,6 +630,8 @@
             facesValue: document.getElementById("facesValue"),
             errorValue: document.getElementById("errorValue"),
             confidenceValue: document.getElementById("confidenceValue"),
+            confidenceMeta: document.getElementById("confidenceMeta"),
+            distanceValue: document.getElementById("distanceValue"),
             fpsValue: document.getElementById("fpsValue"),
             thresholdValue: document.getElementById("thresholdValue"),
             providerValue: document.getElementById("providerValue"),
@@ -633,19 +646,23 @@
             topicValue: document.getElementById("topicValue"),
         };
 
-        let client = null;
+        let ws = null;
+        let reconnectTimer = null;
         let messageCount = 0;
         let movementTopic = els.movementTopicInput.value;
         let statusTopic = els.statusTopicInput.value;
         let lastStatusSeq = -1;
         let lastStatusTimestamp = 0;
         let lastStatusReceivedAt = 0;
+        let lastLoggedConfidencePct = null;
         let renderQueued = false;
         let latestState = {
             movement: "IDLE",
             faces: 0,
             error_x: 0,
             confidence: null,
+            confidence_pct: null,
+            match_distance: null,
             fps: null,
             threshold: null,
             provider: "-",
@@ -660,15 +677,14 @@
         }
 
         function connect() {
-            if (!window.mqtt) {
-                setConnectionState("offline", "MQTT.js missing");
-                addLog("system", "MQTT.js could not load");
-                return;
+            if (ws) {
+                ws.onclose = null;
+                ws.close();
+                ws = null;
             }
-
-            if (client) {
-                client.end(true);
-                client = null;
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
             }
 
             const wsUrl = els.wsUrlInput.value.trim();
@@ -678,48 +694,75 @@
             lastStatusSeq = -1;
             lastStatusTimestamp = 0;
             lastStatusReceivedAt = 0;
+            lastLoggedConfidencePct = null;
+
+            if (!wsUrl.startsWith("ws://") && !wsUrl.startsWith("wss://")) {
+                setConnectionState("offline", "Invalid URL");
+                addLog("error", "WebSocket URL must start with ws:// or wss://");
+                return;
+            }
 
             setConnectionState("connecting", "Connecting");
-            addLog("system", "Connecting to " + wsUrl);
+            addLog("system", "Connecting to relay " + wsUrl);
 
-            client = mqtt.connect(wsUrl, {
-                clientId: "corene-dashboard-" + Math.random().toString(16).slice(2),
-                clean: true,
-                keepalive: 30,
-                reconnectPeriod: 3000,
-                connectTimeout: 8000,
-            });
+            ws = new WebSocket(wsUrl);
 
-            client.on("connect", () => {
+            ws.onopen = () => {
                 setConnectionState("connected", "Live");
-                client.subscribe([movementTopic, statusTopic], { qos: 0 }, (err) => {
-                    if (err) addLog("error", "Subscribe failed");
-                    else addLog("system", "Subscribed to Corene topics");
-                });
-            });
+                addLog("system", "Relay connected — waiting for tracker data");
+            };
 
-            client.on("reconnect", () => setConnectionState("connecting", "Reconnecting"));
-            client.on("close", () => setConnectionState("offline", "Offline"));
-            client.on("error", (err) => addLog("error", err.message || "MQTT error"));
-            client.on("message", handleMqttMessage);
+            ws.onmessage = (event) => handleRelayMessage(event.data);
+
+            ws.onerror = () => {
+                addLog("error", "WebSocket connection error");
+            };
+
+            ws.onclose = () => {
+                setConnectionState("offline", "Offline");
+                addLog("system", "Relay disconnected — retry in 3s");
+                ws = null;
+                reconnectTimer = setTimeout(connect, 3000);
+            };
         }
 
-        function handleMqttMessage(topic, payloadBuffer) {
-            const payload = new TextDecoder().decode(payloadBuffer).trim();
+        function handleRelayMessage(raw) {
+            let envelope;
+            try {
+                envelope = JSON.parse(raw);
+            } catch {
+                addLog("error", "Invalid relay JSON");
+                return;
+            }
+
+            if (envelope.type !== "mqtt_message" || !envelope.topic) {
+                if (envelope.type === "relay_connected") {
+                    addLog("system", envelope.message || "Relay ready");
+                }
+                return;
+            }
+
             messageCount += 1;
             els.messageCount.textContent = String(messageCount);
             els.lastSeen.textContent = "Updated " + new Date().toLocaleTimeString();
 
+            const topic = envelope.topic;
+            const data = envelope.data;
+
             if (topic === movementTopic) {
-                handleRawMovement(payload);
+                const payload =
+                    typeof data === "string"
+                        ? data
+                        : (data && (data.movement || data.status)) || "";
+                handleRawMovement(String(payload).trim());
                 return;
             }
 
             if (topic === statusTopic) {
-                try {
-                    updateStatus(JSON.parse(payload));
-                } catch {
-                    addLog("status", "Invalid JSON payload");
+                if (data && typeof data === "object") {
+                    updateStatus(data);
+                } else {
+                    addLog("status", "Invalid status payload");
                 }
             }
         }
@@ -736,6 +779,17 @@
             }
         }
 
+        function parseConfidence(status) {
+            if (status.confidence_pct != null && Number.isFinite(Number(status.confidence_pct))) {
+                return Number(status.confidence_pct);
+            }
+            const score = status.confidence_score ?? status.confidence;
+            if (score != null && Number.isFinite(Number(score))) {
+                return Number(score) * 100.0;
+            }
+            return null;
+        }
+
         function updateStatus(status) {
             const seq = Number(status.seq);
             const timestamp = Number(status.timestamp || 0);
@@ -747,12 +801,17 @@
             lastStatusReceivedAt = Date.now();
 
             const previousMovement = latestState.movement;
+            const previousConfidencePct = latestState.confidence_pct;
+            const confidencePct = parseConfidence(status);
+
             latestState = {
                 ...latestState,
                 movement: normalizeMovement(status.movement || latestState.movement),
                 faces: status.faces ?? latestState.faces,
                 error_x: status.error_x ?? latestState.error_x,
-                confidence: status.confidence ?? latestState.confidence,
+                confidence: status.confidence_score ?? status.confidence ?? latestState.confidence,
+                confidence_pct: confidencePct,
+                match_distance: status.match_distance ?? latestState.match_distance,
                 fps: status.fps ?? latestState.fps,
                 threshold: status.threshold ?? latestState.threshold,
                 provider: status.provider || latestState.provider,
@@ -764,12 +823,33 @@
             queueRender();
 
             if (latestState.movement !== previousMovement || messageCount % 25 === 0) {
-                const conf = latestState.confidence != null ? ` conf=${formatNumber(latestState.confidence, 3)}` : "";
+                const conf = confidencePct != null ? ` conf=${formatNumber(confidencePct, 1)}%` : "";
                 const found = latestState.locked_face_found ? "visible" : "lost";
                 addLog(
                     "status",
                     `${latestState.movement} | ${latestState.locked ? latestState.target || "locked" : "unlocked"} | ${found}${conf}`
                 );
+            }
+
+            if (
+                confidencePct != null
+                && latestState.locked
+                && latestState.locked_face_found
+                && (
+                    previousConfidencePct == null
+                    || Math.abs(confidencePct - previousConfidencePct) >= 2.0
+                )
+            ) {
+                const band = confidenceBand(confidencePct);
+                addLog(
+                    "confidence",
+                    `${latestState.target || "speaker"} ${formatNumber(confidencePct, 1)}% (${band})` +
+                    (latestState.match_distance != null ? ` dist=${formatNumber(latestState.match_distance, 3)}` : "")
+                );
+                lastLoggedConfidencePct = confidencePct;
+            } else if (confidencePct == null && previousConfidencePct != null && latestState.locked) {
+                addLog("confidence", `${latestState.target || "speaker"} lost — no match`);
+                lastLoggedConfidencePct = null;
             }
         }
 
@@ -787,8 +867,23 @@
 
             els.facesValue.textContent = String(latestState.faces ?? 0);
             els.errorValue.textContent = formatNumber(latestState.error_x, 1) + " px";
-            els.confidenceValue.textContent =
-                latestState.confidence == null ? "-" : formatNumber(latestState.confidence, 3);
+
+            const confPct = latestState.confidence_pct;
+            if (confPct == null || !latestState.locked_face_found) {
+                els.confidenceValue.textContent = "-";
+                els.confidenceValue.className = "";
+                els.confidenceMeta.textContent = latestState.locked && !latestState.locked_face_found
+                    ? "face not visible"
+                    : "";
+            } else {
+                const band = confidenceBand(confPct);
+                els.confidenceValue.textContent = formatNumber(confPct, 1) + "%";
+                els.confidenceValue.className = band === "HIGH" ? "conf-high" : band === "MEDIUM" ? "conf-med" : "conf-low";
+                els.confidenceMeta.textContent = band;
+            }
+
+            els.distanceValue.textContent =
+                latestState.match_distance == null ? "-" : formatNumber(latestState.match_distance, 3);
             els.fpsValue.textContent = latestState.fps == null ? "-" : formatNumber(latestState.fps, 1);
             els.thresholdValue.textContent =
                 latestState.threshold == null ? "-" : formatNumber(latestState.threshold, 3);
@@ -847,6 +942,12 @@
             const num = Number(value);
             if (!Number.isFinite(num)) return "0";
             return num.toFixed(digits);
+        }
+
+        function confidenceBand(pct) {
+            if (pct >= 80) return "HIGH";
+            if (pct >= 60) return "MEDIUM";
+            return "LOW";
         }
 
         els.connectButton.addEventListener("click", connect);

@@ -57,7 +57,8 @@ powershell -ExecutionPolicy Bypass -File firmware/esp32/upload.ps1 -Port COM5
 
 Broker `157.173.101.159:1883` · topic `vision/corene/movement` (ESP32 subscribes here)  
 Commands: `LEFT`, `RIGHT`, `CENTER`, `SEARCH`, `IDLE`  
-Dashboard status: `vision/corene/status` · heartbeat: `vision/corene/heartbeat`
+Dashboard status: `vision/corene/status` · heartbeat: `vision/corene/heartbeat`  
+Dashboard UI: http://localhost:**5500** · MQTT WebSocket relay: ws://localhost:**5501**
 
 ## Keys
 

@@ -20,8 +20,9 @@ class CoreneConfig:
     movement_topic: str = "vision/corene/movement"
     status_topic: str = "vision/corene/status"
     heartbeat_topic: str = "vision/corene/heartbeat"
-    dashboard_ws_url: str = "ws://157.173.101.159:9001"
-    websocket_relay_port: int = 9002
+    dashboard_ws_url: str = "ws://127.0.0.1:5501"
+    dashboard_http_port: int = 5500
+    websocket_relay_port: int = 5501
 
     db_path: Path = REPO_ROOT / "data" / "db" / "face_db.npz"
     db_meta_path: Path = REPO_ROOT / "data" / "db" / "face_db.json"
