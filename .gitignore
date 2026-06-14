@@ -9,3 +9,4 @@ data/db/
 data/enroll/
 data/logs/
 data/locked_identity.json
+logs/

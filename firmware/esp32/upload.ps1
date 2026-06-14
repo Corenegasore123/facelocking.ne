@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$SketchDir = Join-Path $PSScriptRoot "face_tracker"
+$SketchDir = Join-Path $PSScriptRoot "face_tracker_servo"
 $CliCandidates = @(
     "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe",
     "arduino-cli"

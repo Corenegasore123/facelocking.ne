@@ -11,7 +11,18 @@ const char *WIFI_SSID = "EdNet";
 const char *WIFI_PASSWORD = "Huawei@123";
 
 // =========================
-// MQTT Settings
+// MQTT Settings — must match src/recognize_mqtt.py
+//   Broker: 157.173.101.159:1883
+//   Topic:  vision/corene/movement  (plain text, QoS 0)
+//   Commands from Python:
+//     LEFT   — pan while face is left of center
+//     RIGHT  — pan while face is right of center
+//     CENTER — hold (no sweep)
+//     SEARCH — sweep until IDLE/CENTER/LEFT/RIGHT received
+//     IDLE   — hold position (stop search/track)
+//   Python SEARCH heartbeat: default 0.2s (--mqtt-search-heartbeat)
+//   Python min republish:    default 0.15s (--mqtt-min-interval)
+//   Keep COMMAND_TIMEOUT_MS well above those intervals.
 // =========================
 const char *MQTT_SERVER = "157.173.101.159";
 const uint16_t MQTT_PORT = 1883;
@@ -39,17 +50,16 @@ const int SERVO_CENTER_ANGLE = 90;
 const int SERVO_MIN_PULSE_US = 500;
 const int SERVO_MAX_PULSE_US = 2400;
 
-// Tracking parameters (face visible - fast, fine adjustments for smooth following)
-const float TRACK_STEP = 0.35f;             // Small steps for precise tracking
-const unsigned long TRACK_INTERVAL_MS = 18;  // ~55 Hz - responsive face following
+// Tracking — follow LEFT/RIGHT from recognize_mqtt (head in frame)
+const float TRACK_STEP = 0.2f;
+const unsigned long TRACK_INTERVAL_MS = 40;
 
-// Search/Sweep parameters (face lost - visible sweep, not frantic)
-const float SCAN_STEP = 2.0f;                // 2° per step - visible movement
-const unsigned long SCAN_INTERVAL_MS = 100;  // Every 100ms - smooth sweep
-// Full 0-180° sweep: 90 steps × 100ms = 9 seconds per direction
+// Search — faster sweep while face is lost (IDLE from PC stops immediately)
+const float SCAN_STEP = 2.0f;
+const unsigned long SCAN_INTERVAL_MS = 80;
 
-// Command timeout - must be longer than Python's SEARCH heartbeat (0.2s)
-const unsigned long COMMAND_TIMEOUT_MS = 4000;  // 4 seconds before auto-IDLE
+// > recognize_mqtt --mqtt-search-heartbeat (0.2s) and --mqtt-min-interval (0.15s)
+const unsigned long COMMAND_TIMEOUT_MS = 5000;
 
 const bool REVERSE_SERVO = true;
 
@@ -146,11 +156,18 @@ MovementCommand parseCommand(String message) {
     message = message.substring(4);
   }
 
+  // Primary strings (recognize_mqtt.py MOVEMENT_* constants)
   if (message == "LEFT")   return CMD_LEFT;
   if (message == "RIGHT")  return CMD_RIGHT;
   if (message == "CENTER") return CMD_CENTER;
   if (message == "SEARCH") return CMD_SEARCH;
   if (message == "IDLE")   return CMD_IDLE;
+
+  // Aliases (BENAX / dashboard normalizeMovement)
+  if (message == "MOVED_LEFT" || message == "MOVE_LEFT")   return CMD_LEFT;
+  if (message == "MOVED_RIGHT" || message == "MOVE_RIGHT") return CMD_RIGHT;
+  if (message == "CENTERED" || message == "STOP" || message == "STOPPED") return CMD_IDLE;
+  if (message == "SEARCHING" || message == "SCAN" || message == "OUT_OF_FRAME") return CMD_SEARCH;
 
   return CMD_IDLE;
 }
@@ -196,6 +213,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print(message);
     Serial.println("                          │");
     Serial.println("└─────────────────────────────────────────┘");
+  }
+
+  // Refresh servo hold when IDLE/CENTER stops an active SEARCH sweep
+  if (currentCommand == CMD_IDLE || currentCommand == CMD_CENTER) {
+    panServo.writeMicroseconds(angleToPulse(servoAngle));
   }
 }
 
@@ -393,8 +415,7 @@ void handleServo() {
   }
 
   // ──────────────────────────────────────
-  // SEARCH: Sweep back and forth at moderate speed
-  // 2° every 100ms = ~9 second full sweep
+  // SEARCH: Sweep back and forth; recognize_mqtt SEARCH heartbeat every 0.2s
   // ──────────────────────────────────────
   if (currentCommand == CMD_SEARCH) {
     if (now - lastMoveAt < SCAN_INTERVAL_MS) {
@@ -402,7 +423,6 @@ void handleServo() {
     }
     lastMoveAt = now;
 
-    // Move 2 degrees in current direction
     setServoAngle(servoAngle + (sweepDirection * SCAN_STEP));
 
     // Reverse direction at limits
@@ -530,9 +550,9 @@ void setup() {
   Serial.println("  COMMANDS:");
   Serial.println("    IDLE   = Hold position");
   Serial.println("    CENTER = Return to 90°");
-  Serial.println("    LEFT   = Track face (0.35° steps)");
-  Serial.println("    RIGHT  = Track face (0.35° steps)");
-  Serial.println("    SEARCH = Sweep 0-180° (~9 sec)");
+  Serial.println("    LEFT   = Track face (slow steps)");
+  Serial.println("    RIGHT  = Track face (slow steps)");
+  Serial.println("    SEARCH = Sweep 0-180° (~7 sec)");
   Serial.println("═══════════════════════════════════════════");
   Serial.println();
   Serial.println("[SYS] Ready. Waiting for MQTT commands...");

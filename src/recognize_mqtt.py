@@ -586,6 +586,7 @@ class MqttMovementPublisher:
         self.connected = False
         self._stop_event = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
 
         if mqtt is None:
             raise RuntimeError("paho-mqtt is not installed. Add it to requirements and run pip install -r requirements.txt")
@@ -624,8 +625,9 @@ class MqttMovementPublisher:
         while not self._stop_event.wait(self.heartbeat_interval):
             if not self.connected:
                 continue
-            if self.last_command != MOVEMENT_SEARCH:
-                continue
+            with self._lock:
+                if self.last_command != MOVEMENT_SEARCH:
+                    continue
             try:
                 self.client.publish(self.topic, payload=MOVEMENT_SEARCH, qos=0, retain=False)
             except Exception:
@@ -633,19 +635,20 @@ class MqttMovementPublisher:
 
     def publish(self, command: str, force: bool = False):
         now = time.time()
-        if (
-            not force
-            and command == self.last_command
-            and (now - self.last_publish_at) < self.min_publish_interval
-        ):
-            return
-        if not self.connected:
-            return
+        with self._lock:
+            if (
+                not force
+                and command == self.last_command
+                and (now - self.last_publish_at) < self.min_publish_interval
+            ):
+                return
+            if not self.connected:
+                return
 
-        info = self.client.publish(self.topic, payload=command, qos=0, retain=False)
-        if info.rc == mqtt.MQTT_ERR_SUCCESS:
-            self.last_command = command
-            self.last_publish_at = now
+            info = self.client.publish(self.topic, payload=command, qos=0, retain=False)
+            if info.rc == mqtt.MQTT_ERR_SUCCESS:
+                self.last_command = command
+                self.last_publish_at = now
 
     def publish_status(self, status: Dict[str, object], force: bool = False):
         now = time.time()
@@ -1029,15 +1032,14 @@ def main():
                 face_lost_counter = 0  # Reset lost counter
                 
                 if face_missing_since is not None:
-                    # Was previously lost, now confirming reacquire
+                    # Was previously lost, now confirming reacquire — stop sweep immediately
                     face_found_counter += 1
                     if face_found_counter >= found_confirm_frames:
                         print(f"[FaceLock] {face_lock.target_name} REACQUIRED - tracking")
                         face_missing_since = None
                         face_found_counter = 0
                         filtered_error_x = None  # Reset filter on reacquire
-                    # During reacquire confirmation, hold CENTER
-                    movement_command = MOVEMENT_CENTER
+                    movement_command = MOVEMENT_IDLE
                     movement_error_x = 0.0
                 else:
                     # Normal tracking - face is visible
@@ -1109,7 +1111,12 @@ def main():
                 movement_error_x = 0.0
 
             if mqtt_publisher is not None:
-                mqtt_publisher.publish(movement_command)
+                was_searching = mqtt_publisher.last_command == MOVEMENT_SEARCH
+                force_publish = (
+                    movement_command != MOVEMENT_SEARCH
+                    and (was_searching or (face_lock and locked_face_found and face_missing_since is not None))
+                )
+                mqtt_publisher.publish(movement_command, force=force_publish)
                 mqtt_publisher.publish_status(
                     build_dashboard_status(
                         movement_command=movement_command,

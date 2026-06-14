@@ -45,7 +45,7 @@ def main():
     
     detector = vision.FaceLandmarker.create_from_options(options)
     
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Camera not opened. Try camera index 0/1/2.")
     
