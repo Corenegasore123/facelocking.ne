@@ -39,17 +39,17 @@ const int SERVO_CENTER_ANGLE = 90;
 const int SERVO_MIN_PULSE_US = 500;
 const int SERVO_MAX_PULSE_US = 2400;
 
-// Tracking — slow pan while following head left/right in frame
-const float TRACK_STEP = 0.18f;
-const unsigned long TRACK_INTERVAL_MS = 45;
+// Tracking parameters (face visible - fast, fine adjustments for smooth following)
+const float TRACK_STEP = 0.35f;             // Small steps for precise tracking
+const unsigned long TRACK_INTERVAL_MS = 18;  // ~55 Hz - responsive face following
 
-// Search — slow sweep so reacquire + IDLE stop is easy
-const float SCAN_STEP = 0.75f;
-const unsigned long SCAN_INTERVAL_MS = 220;
-// Full 0-180 sweep: ~240 steps x 220ms ~ 53s per half sweep
+// Search/Sweep parameters (face lost - visible sweep, not frantic)
+const float SCAN_STEP = 2.0f;                // 2° per step - visible movement
+const unsigned long SCAN_INTERVAL_MS = 100;  // Every 100ms - smooth sweep
+// Full 0-180° sweep: 90 steps × 100ms = 9 seconds per direction
 
-// Must exceed Python SEARCH heartbeat interval
-const unsigned long COMMAND_TIMEOUT_MS = 5000;
+// Command timeout - must be longer than Python's SEARCH heartbeat (0.2s)
+const unsigned long COMMAND_TIMEOUT_MS = 4000;  // 4 seconds before auto-IDLE
 
 const bool REVERSE_SERVO = true;
 
@@ -530,9 +530,9 @@ void setup() {
   Serial.println("  COMMANDS:");
   Serial.println("    IDLE   = Hold position");
   Serial.println("    CENTER = Return to 90°");
-  Serial.println("    LEFT   = Track face (slow steps)");
-  Serial.println("    RIGHT  = Track face (slow steps)");
-  Serial.println("    SEARCH = Slow sweep 0-180 deg");
+  Serial.println("    LEFT   = Track face (0.35° steps)");
+  Serial.println("    RIGHT  = Track face (0.35° steps)");
+  Serial.println("    SEARCH = Sweep 0-180° (~9 sec)");
   Serial.println("═══════════════════════════════════════════");
   Serial.println();
   Serial.println("[SYS] Ready. Waiting for MQTT commands...");
